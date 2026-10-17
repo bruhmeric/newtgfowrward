@@ -395,6 +395,41 @@ See [Render setup (in original README)](#render-setup-details) below for the ful
 > passes in under a second and webhook updates arriving early get a `503`
 > (Telegram retries them automatically — nothing is lost).
 
+### Web dashboard & health endpoint
+
+Once deployed, open the service URL in a browser — you get a live status
+page (auto-refreshes every 5 s):
+
+* **Status badge** — READY / STARTING / STARTUP ERROR
+* **Startup diagnostics** — failing phase, the actual error, and a
+  plain-English *"How to fix"* hint (e.g. `BOT_TOKEN` rejected → check
+  @BotFather and the Render Environment tab)
+* **Live stats** — uptime, memory vs the 512 MB free-tier limit, mode,
+  bot username, Telethon session state, destination group
+* **Telegram webhook diagnostics** — pending update count and the last
+  delivery error straight from `get_webhook_info`
+* **Environment checklist** — which of `BOT_TOKEN`, `API_ID`, `API_HASH`,
+  `SESSION_STRING`, ... are set or missing (values are never shown)
+
+If the bot can't start (bad token, missing var, network blip), the process
+**stays up and keeps retrying with backoff** (5 s → 5 min) instead of
+exit-crash-looping — so the dashboard always shows you exactly what is
+wrong, right in the browser, no log digging required. Fix the env var in
+Render → Environment, redeploy, and the next attempt comes up.
+
+For monitoring tools (UptimeRobot, cron-job.org, ...): `GET /health`
+returns plain text:
+
+```
+OK
+uptime_sec: 1234
+ready: True
+rss_mb: 142
+```
+
+and when the bot is not up yet, `phase:`, `error:` and `hint:` lines are
+included so even a curl tells you what's wrong.
+
 <a id="render-setup-details"></a>
 
 ### Render Blueprint (`render.yaml`)
@@ -450,6 +485,12 @@ telegram-forwarder-bot/
 ## Troubleshooting
 
 ### `/start` doesn't respond
+
+1. Open the **service URL** in a browser — the dashboard shows the startup
+   phase, the error (if any), a fix hint, and which env vars are missing.
+   This is the fastest way to diagnose a broken deploy.
+2. `curl https://<your-service>.onrender.com/health` — same info in plain text.
+3. Check `/status` — it shows uptime, memory, mode, Telethon state, and keep-alive state at a glance
 
 - Check Render logs for the startup sequence (`Health server listening` → `Bot started: @... mode=webhook`) — if absent, the service is crashing; the log will show why
 - Check `https://api.telegram.org/bot<TOKEN>/getWebhookInfo` — `url` should match your Render URL, `last_error_message` should be empty

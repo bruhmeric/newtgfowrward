@@ -139,27 +139,38 @@ class UserSession:
             self.client = TelegramClient(session_name, api_id, api_hash)
             self._uses_string_session = False
         self._started = False
+        # Human-readable reason for the last failed start() — shown on the
+        # web dashboard so a bad SESSION_STRING is obvious without log access.
+        self.last_error: Optional[str] = None
+        # "@username (id)" after a successful connect — for the dashboard.
+        self.connected_as: Optional[str] = None
 
     async def start(self) -> bool:
         """Connect using an existing session. Returns False if no session
         exists or the session is invalid. Callers should NOT call interactive
         login here — that's done by login.py."""
+        self.last_error = None
         if not self._uses_string_session and not os.path.exists(self.session_filename):
             logger.warning("Telethon session file missing — run python login.py first.")
+            self.last_error = "no session file and no SESSION_STRING set — run login.py"
             return False
         try:
             await self.client.connect()
             if not await self.client.is_user_authorized():
                 logger.warning("Telethon session exists but is not authorized.")
                 await self.client.disconnect()
+                self.last_error = ("SESSION_STRING is invalid, expired, or was "
+                                   "revoked — generate a fresh one with login.py")
                 return False
             self._started = True
+            self.connected_as = await self._safe_get_me()
             logger.info("Telethon user session connected as %s (mode=%s)",
-                        await self._safe_get_me(),
+                        self.connected_as,
                         "string" if self._uses_string_session else "file")
             return True
-        except Exception:
+        except Exception as e:
             logger.exception("Failed to start Telethon client")
+            self.last_error = f"{type(e).__name__}: {e}"
             return False
 
     async def _safe_get_me(self) -> str:

@@ -3,8 +3,45 @@
 This release fixes several real bugs, hardens the webhook server, and tunes
 the bot specifically for Render's free tier (512 MB RAM / 0.1 CPU / 15-min
 sleep / ephemeral disk). All changes are covered by `smoke_test.py`
-(29 checks) and `webhook_e2e_test.py` (11 checks) — run both locally with
+(29 checks) and `webhook_e2e_test.py` (19 checks) — run both locally with
 `pip install -r requirements.txt` first.
+
+---
+
+## Post-deploy hotfix: crash-loop + missing dashboard
+
+**Symptom:** Render said "deployed", but visiting the URL showed only
+`ready: False` with a low `uptime_sec`, and the bot never answered.
+
+### 7. Startup failures crash-looped the service (root cause)
+Any exception during the Telegram handshake — a rejected `BOT_TOKEN`
+(`InvalidToken`/`Unauthorized`), a failed `set_webhook`, a network blip —
+escaped `_run_webhook_custom()` and hit `sys.exit(1)`. Render then restarted
+the container, which failed again, forever. Every visit landed on a
+16-second-old instance showing `ready: False`, and the actual error was
+buried in Render's Logs tab. Startup now **retries with backoff
+(5 s → 5 min) inside the live process**: partial state is torn down per
+attempt (Telethon disconnected, PTB re-initialized, DB stays open via an
+idempotent `init()`), the error + a plain-English fix hint are recorded,
+and SIGTERM still exits cleanly at any point — even mid-backoff.
+
+### 8. Web dashboard at the service root
+`GET /` was a bare plain-text health string — users expected a dashboard.
+The root now serves a self-contained HTML status page (auto-refresh 5 s,
+no external assets, secrets scrubbed): status badge, failing startup phase,
+the error + *How to fix* hint, uptime, memory vs the 512 MB limit, bot
+username, Telethon session state (including *why* it isn't connected),
+destination group, Telegram webhook diagnostics (pending updates, last
+delivery error from `get_webhook_info`, cached 15 s), and an env-var
+checklist (set / missing / optional — values never shown). Plain-text health
+moved to `GET /health` (and `GET /<webhook-path>`), now with `phase:`,
+`error:` and `hint:` lines when the bot isn't up.
+
+### 9. Telethon failure reasons surfaced
+`UserSession.start()` swallowed the reason it failed. It now records
+`last_error` (missing session / unauthorized SESSION_STRING / exception)
+and `connected_as`, both shown on the dashboard — a bad `SESSION_STRING`
+no longer requires log access to diagnose.
 
 ---
 
@@ -179,7 +216,9 @@ scrapes on the 0.1-CPU instance.
 ## New files
 
 - `smoke_test.py` — 29 offline checks (config, parsing, DB, secrets, keyboard cap)
-- `webhook_e2e_test.py` — 11 live checks of the webhook server with a mocked
-  Telegram API (secret validation, 503-before-ready, keep-alive, SIGTERM)
+- `webhook_e2e_test.py` — 19 live checks of the webhook server with a mocked
+  Telegram API (secret validation, 503-before-ready, keep-alive, SIGTERM,
+  plus a crash-loop regression scenario: failed startup must stay up,
+  surface the error, and still shut down cleanly)
 
 Run them: `python smoke_test.py && python webhook_e2e_test.py`

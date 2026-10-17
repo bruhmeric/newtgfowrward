@@ -37,6 +37,11 @@ class Database:
         self._write_lock = asyncio.Lock()
 
     async def init(self) -> None:
+        # Idempotent: the webhook server retries startup on failure, and each
+        # retry re-runs post_init -> db.init(). Without this guard we would
+        # open (and leak) a second SQLite connection per attempt.
+        if self._conn is not None:
+            return
         self._conn = await aiosqlite.connect(self.path)
         self._conn.row_factory = aiosqlite.Row
         # Perf pragmas — WAL keeps readers unblocked, NORMAL avoids an
