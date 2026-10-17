@@ -255,7 +255,22 @@ def _render_dashboard(cfg: Config, state: dict) -> str:
         us_cls = "err"     # there is a concrete reason — draw the eye
     else:                   # connecting / starting / not configured
         us_cls = "warn"
-    cards.append(card("Telethon session", f'<span class="{us_cls}">{esc(us_status)}</span>'))
+    # Second line on the card: WHICH datacenter the session dials + the last
+    # raw-TCP probe result. This is what turns "timed out" into an
+    # actionable diagnosis without opening the service logs.
+    us_extra = ""
+    us_mgr = _USER_SESSION_MGR.get("us")
+    if us_mgr is not None and getattr(us_mgr, "session_info", None):
+        si = us_mgr.session_info
+        parts = [f"DC{si.get('dc_id', '?')} · {si.get('server', '?')}:{si.get('port', '?')}"]
+        probe = getattr(us_mgr, "last_probe", None)
+        if probe:
+            parts.append(f"probe {probe.get('ms')} ms OK" if probe.get("ok")
+                         else f"probe FAILED — {probe.get('error')}")
+        us_extra = ('<div class="dim" style="margin-top:4px;font-size:11px;">'
+                    f'{esc(" · ".join(parts))}</div>')
+    cards.append(card("Telethon session",
+                      f'<span class="{us_cls}">{esc(us_status)}</span>{us_extra}'))
     cards.append(card(
         "Destination group",
         esc(str(cfg.destination_group_id)) if cfg.destination_group_id
@@ -370,6 +385,12 @@ async def _user_session_loop(app: Application, cfg: Config) -> None:
     """
     delays = [30, 60, 120, 300]  # backoff between retries, capped at 5 min
     attempt = 0
+    # Let the rest of startup settle (webhook registration, PTB update
+    # backlog) before the first Telethon connect — on a cold 0.1-CPU
+    # free-tier instance those first seconds are the busiest the event loop
+    # ever gets, and a connect racing that noise is more likely to time out.
+    _STATE["user_session"] = "connecting (waiting for startup to settle)…"
+    await asyncio.sleep(10)
     while True:
         attempt += 1
         us = UserSession(
@@ -708,6 +729,21 @@ async def _run_webhook_custom(app: Application, cfg: Config) -> None:
         # its state so "ready: True" + "telethon: not connected" is not a
         # mystery (locked channels/topics will be unavailable, nothing else).
         body += f"telethon: {_scrub(cfg, str(state.get('user_session', '?')))}\n"
+        # Which DC the session dials + last raw-TCP probe result — the two
+        # facts needed to diagnose a Telethon connect timeout from curl alone.
+        us = _USER_SESSION_MGR.get("us")
+        if us is not None and getattr(us, "session_info", None):
+            si = us.session_info
+            body += (f"telethon_dc: DC{si.get('dc_id', '?')} "
+                     f"{si.get('server', '?')}:{si.get('port', '?')}\n")
+            probe = getattr(us, "last_probe", None)
+            if probe:
+                if probe.get("ok"):
+                    body += f"telethon_probe: ok {probe.get('ms')}ms\n"
+                else:
+                    body += (f"telethon_probe: FAIL {probe.get('error')}\n")
+                    if probe.get("verdict"):
+                        body += f"telethon_verdict: {probe['verdict']}\n"
         body += f"rss_mb: {_rss_mb():.0f}\n"
         return web.Response(text=body, status=200, content_type="text/plain")
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import ipaddress
 import logging
 import os
 import re
@@ -35,6 +36,42 @@ except ImportError:  # pragma: no cover — very old Telethon
     from telethon.tl.functions.messages import GetForumTopicsRequest  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+
+# ---------- Telegram datacenter reachability diagnostics ----------
+
+# Official production DC IPv4 endpoints (same list Telethon ships with).
+# Used ONLY for reachability probing — the session itself decides which DC
+# the client actually connects to.
+TELEGRAM_DC_IPS: dict[int, str] = {
+    1: "149.154.175.53",    # DC1 — Miami
+    2: "149.154.167.51",    # DC2 — Amsterdam (Telethon default)
+    3: "149.154.175.100",   # DC3 — Miami
+    4: "149.154.167.91",    # DC4 — Amsterdam
+    5: "91.108.56.130",     # DC5 — Singapore
+}
+
+# Process-wide cache for the all-DC sweep so a retrying loop doesn't hammer
+# five datacenters on every attempt — once per process is plenty.
+_DC_SWEEP_CACHE: dict | None = None
+
+
+def classify_session_address(addr: str) -> str:
+    """Classify the server address embedded in a session string.
+
+    Returns 'telegram' (an official DC IP), 'private' (RFC1918/loopback —
+    the string was generated behind a VPN/proxy and can NEVER work from a
+    public host like Render), 'public' (some other global IP — suspicious
+    but still attempted), or 'hostname'."""
+    if not addr:
+        return "unknown"
+    if addr in TELEGRAM_DC_IPS.values():
+        return "telegram"
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return "hostname"
+    return "public" if ip.is_global else "private"
 
 
 # ---------- link parsing ----------
@@ -131,9 +168,13 @@ class UserSession:
     # session string pointing at an unreachable data center (or a network
     # black hole) hangs FOREVER. These ceilings turn a hang into a clean,
     # explainable failure that the bot can show on its dashboard.
-    CONNECT_TIMEOUT = int(os.environ.get("TELETHON_CONNECT_TIMEOUT", "30"))
-    AUTH_CHECK_TIMEOUT = 20
+    # 60 s (up from 30): on a cold 0.1-CPU free-tier instance the first
+    # MTProto handshake can legitimately take tens of seconds; a timeout
+    # that fires too early looks identical to a broken session.
+    CONNECT_TIMEOUT = int(os.environ.get("TELETHON_CONNECT_TIMEOUT", "60"))
+    AUTH_CHECK_TIMEOUT = 30
     RPC_TIMEOUT = 20
+    PROBE_TIMEOUT = 8  # raw TCP probe of the DC before Telethon connects
 
     def __init__(self, session_name: str, api_id: int, api_hash: str,
                  session_string: Optional[str] = None) -> None:
@@ -142,6 +183,11 @@ class UserSession:
         preferred for ephemeral filesystems like Render's free tier."""
         self._init_error: Optional[str] = None
         self._dialogs_warmed = 0
+        # Non-secret facts about the parsed session (dc/server/port) + the
+        # result of the last TCP reachability probe — shown on the dashboard
+        # so "why won't Telethon connect" is answerable WITHOUT log access.
+        self.session_info: dict = {}
+        self.last_probe: Optional[dict] = None
         if session_string:
             from telethon.sessions import StringSession
             try:
@@ -157,7 +203,60 @@ class UserSession:
                 # Build the client with a blank StringSession so self.client is
                 # always a valid TelegramClient; start() refuses to use it.
                 session_obj = StringSession()
-            self.client = TelegramClient(session_obj, api_id, api_hash)
+            else:
+                # Parse succeeded — introspect what the string actually points
+                # at. NONE of this is secret (the auth key itself never leaves
+                # the process), and it answers the #1 mystery of "connect
+                # timed out": WHICH address was being dialed.
+                try:
+                    key_len = 0
+                    if session_obj.auth_key is not None:
+                        key_len = len(session_obj.auth_key.key or b"")
+                    self.session_info = {
+                        "dc_id": session_obj.dc_id,
+                        "server": session_obj.server_address,
+                        "port": session_obj.port,
+                        "auth_key_bytes": key_len,
+                    }
+                    logger.info(
+                        "SESSION_STRING parsed: DC%s -> %s:%s (auth key: %d bytes)",
+                        session_obj.dc_id, session_obj.server_address,
+                        session_obj.port, key_len)
+                except Exception:
+                    logger.debug("session introspection failed", exc_info=True)
+                kind = classify_session_address(str(self.session_info.get("server") or ""))
+                self.session_info["address_kind"] = kind
+                if kind == "private":
+                    # A private/loopback address embedded in the string means it
+                    # was generated behind a VPN, an MTProto proxy, or a broken
+                    # generator. It can NEVER connect from a public host — fail
+                    # fast with instructions instead of timing out for 60 s
+                    # on every retry forever.
+                    self._init_error = (
+                        f"SESSION_STRING embeds a private address "
+                        f"({self.session_info.get('server')}) — it was generated "
+                        "behind a VPN/proxy. Regenerate WITHOUT the proxy: "
+                        "python login.py --string (same API_ID/API_HASH)")
+                    logger.error("%s", self._init_error)
+                    session_obj = StringSession()
+                elif kind == "public":
+                    logger.warning(
+                        "SESSION_STRING points at %s, which is NOT a known "
+                        "Telegram DC IP — if connects keep timing out, regenerate "
+                        "the string with: python login.py --string",
+                        self.session_info.get("server"))
+            self.client = TelegramClient(
+                session_obj, api_id, api_hash,
+                # The background loop in bot.py owns the retry policy (backoff
+                # + dashboard state) — keep Telethon's internal retries small
+                # so failures surface quickly instead of hanging inside
+                # attempt #1 of 5 while the outer wait_for() fires.
+                connection_retries=3, retry_delay=2,
+                auto_reconnect=True,
+                # A StringSession embeds an IPv4 DC address; never let Telethon
+                # try IPv6 (blackholed AAAA routes hang the connect).
+                use_ipv6=False,
+            )
             self._uses_string_session = True
         else:
             self.client = TelegramClient(session_name, api_id, api_hash)
@@ -168,6 +267,85 @@ class UserSession:
         self.last_error: Optional[str] = None
         # "@username (id)" after a successful connect — for the dashboard.
         self.connected_as: Optional[str] = None
+
+    def _session_target_desc(self) -> str:
+        """Human description of the endpoint this session dials, e.g.
+        'DC4 (149.154.167.91:443)' — used in error messages and logs so a
+        timeout is never a mystery about WHERE it was trying to go."""
+        si = self.session_info or {}
+        if si.get("server"):
+            dc = f"DC{si.get('dc_id', '?')} " if si.get("dc_id") else ""
+            return f"{dc}({si['server']}:{si.get('port', '?')})"
+        return "the session's data center"
+
+    @staticmethod
+    async def _probe_tcp(host: str, port: int, timeout: float = 8.0) -> dict:
+        """Raw TCP connect probe, independent of Telethon.
+
+        Answers the question a Telethon timeout cannot: is the datacenter
+        reachable from THIS host at all? Returns a small dict with
+        ok / ms / error — never raises."""
+        t0 = time.monotonic()
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=timeout)
+            try:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=5)
+            except Exception:
+                pass
+            return {"ok": True, "ms": int((time.monotonic() - t0) * 1000),
+                    "error": None}
+        except asyncio.TimeoutError:
+            return {"ok": False, "ms": int((time.monotonic() - t0) * 1000),
+                    "error": f"no TCP answer in {timeout:.0f}s (blackholed/filtered)"}
+        except Exception as e:
+            return {"ok": False, "ms": int((time.monotonic() - t0) * 1000),
+                    "error": f"{type(e).__name__}: {e}"}
+
+    async def _probe_session_dc(self) -> None:
+        """Probe the session's own DC, and if it fails, sweep ALL official
+        DCs (once per process). Populates self.last_probe with a verdict that
+        the dashboard shows — turning 'timed out' into an actionable cause:
+        either 'this host cannot reach MTProto at all' or 'the string's DC
+        specifically is unreachable (regenerate it)'."""
+        global _DC_SWEEP_CACHE
+        si = self.session_info or {}
+        host, port = si.get("server"), int(si.get("port") or 443)
+        if not host:
+            return
+        probe = await self._probe_tcp(host, port, timeout=self.PROBE_TIMEOUT)
+        self.last_probe = {"host": f"{host}:{port}", **probe}
+        if probe["ok"]:
+            logger.info("MTProto probe: %s:%s reachable in %dms — handing over "
+                        "to Telethon", host, port, probe["ms"])
+            return
+        logger.warning("MTProto probe FAILED: %s:%s — %s. Sweeping all "
+                       "Telegram DCs to localize the problem...",
+                       host, port, probe["error"])
+        if _DC_SWEEP_CACHE is None:
+            ips = list(TELEGRAM_DC_IPS.items())
+            results = await asyncio.gather(
+                *(self._probe_tcp(ip, 443, timeout=6) for _dc, ip in ips))
+            _DC_SWEEP_CACHE = {dc: r for (dc, _ip), r in zip(ips, results)}
+        sweep = _DC_SWEEP_CACHE
+        reachable = sorted(dc for dc, r in sweep.items() if r["ok"])
+        self.last_probe["sweep"] = {
+            str(dc): (f"OK ({r['ms']}ms)" if r["ok"] else r["error"])
+            for dc, r in sweep.items()}
+        if reachable:
+            self.last_probe["verdict"] = (
+                f"DCs {reachable} ARE reachable, but this session's DC "
+                f"({host}) is NOT — the SESSION_STRING points somewhere this "
+                "host can't reach. Regenerate it: python login.py --string")
+        else:
+            self.last_probe["verdict"] = (
+                "NO Telegram DC accepts TCP connections from this host — "
+                "MTProto egress is blocked (the Bot API over HTTPS still "
+                "works, which is why the bot itself is fine). Telethon can "
+                "never connect from this network.")
+        logger.warning("DC sweep: %s | verdict: %s",
+                       self.last_probe["sweep"], self.last_probe["verdict"])
 
     async def start(self) -> bool:
         """Connect using an existing session. Returns False if no session
@@ -186,14 +364,35 @@ class UserSession:
             logger.warning("Telethon session file missing — run python login.py first.")
             self.last_error = "no session file and no SESSION_STRING set — run login.py"
             return False
+        # Reachability check FIRST: if raw TCP to the DC can't even complete,
+        # Telethon's connect() would just hang until the timeout — the probe
+        # turns that into a concrete, dashboard-visible cause instead.
+        if self._uses_string_session and self.session_info.get("server"):
+            try:
+                await self._probe_session_dc()
+            except Exception:
+                logger.debug("DC probe crashed (ignored — connect proceeds)",
+                             exc_info=True)
         try:
             await asyncio.wait_for(self.client.connect(), timeout=self.CONNECT_TIMEOUT)
         except asyncio.TimeoutError:
             await self._force_disconnect()
+            probe_note = ""
+            if self.last_probe:
+                if self.last_probe.get("verdict"):
+                    probe_note = f" Probe verdict: {self.last_probe['verdict']}"
+                else:
+                    probe_note = (f" (raw TCP probe reached "
+                                  f"{self.last_probe.get('host')} in "
+                                  f"{self.last_probe.get('ms')}ms — the TCP path "
+                                  "works, so the hang is in the MTProto "
+                                  "handshake: likely a corrupt auth key)")
             self.last_error = (
-                f"connection timed out after {self.CONNECT_TIMEOUT}s — Telegram is "
-                "unreachable from this host, or the SESSION_STRING is corrupt")
-            logger.warning("Telethon connect timed out after %ss", self.CONNECT_TIMEOUT)
+                f"connection to {self._session_target_desc()} timed out after "
+                f"{self.CONNECT_TIMEOUT}s — Telegram MTProto is unreachable "
+                f"from this host, or the SESSION_STRING is corrupt.{probe_note}")
+            logger.warning("Telethon connect timed out after %ss (target: %s)",
+                           self.CONNECT_TIMEOUT, self._session_target_desc())
             return False
         except Exception as e:
             await self._force_disconnect()

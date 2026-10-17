@@ -202,6 +202,101 @@ print("== 8. health payload helper (RSS reading) ==")
 rss = bot_mod._rss_mb()
 check("rss_mb returns a plausible number", rss == -1.0 or rss > 1.0, f"got {rss}")
 
+print("== 9. Telethon session diagnostics (new) ==")
+
+# 9a. address classification
+check("official DC IP classified 'telegram'",
+      us_mod.classify_session_address("149.154.167.51") == "telegram")
+check("private IP classified 'private'",
+      us_mod.classify_session_address("10.0.0.5") == "private")
+check("loopback classified 'private'",
+      us_mod.classify_session_address("127.0.0.1") == "private")
+check("other global IP classified 'public'",
+      us_mod.classify_session_address("8.8.8.8") == "public")
+check("hostname classified 'hostname'",
+      us_mod.classify_session_address("venus.web.telegram.org") == "hostname")
+check("empty address classified 'unknown'",
+      us_mod.classify_session_address("") == "unknown")
+
+
+def _make_session_string(dc_id: int, ip: str, port: int = 443) -> str:
+    """Craft a valid-format Telethon StringSession without any network use."""
+    import os as _os
+    from telethon.crypto import AuthKey
+    from telethon.sessions import StringSession
+    s = StringSession()
+    s.set_dc(dc_id, ip, port)
+    s._auth_key = AuthKey(data=_os.urandom(256))
+    return s.save()
+
+
+async def session_diag_tests() -> None:
+    # 9b. introspection: __init__ must expose dc/server/port without connecting
+    good = us_mod.UserSession(
+        "t", 12345, "abcdef", session_string=_make_session_string(4, "149.154.167.91"))
+    check("session introspection extracts DC info",
+          good.session_info.get("dc_id") == 4
+          and good.session_info.get("server") == "149.154.167.91"
+          and good.session_info.get("port") == 443,
+          f"got {good.session_info}")
+    check("official DC session accepted (no init error)", good._init_error is None)
+    check("official DC session has 256-byte auth key",
+          good.session_info.get("auth_key_bytes") == 256)
+    check("_session_target_desc names the DC",
+          "149.154.167.91" in good._session_target_desc()
+          and "DC4" in good._session_target_desc())
+
+    # 9c. private-address session: fail FAST with a clear message, no network
+    import time as _t
+    bad = us_mod.UserSession(
+        "t", 12345, "abcdef", session_string=_make_session_string(2, "10.6.0.7"))
+    check("private-address session flagged at parse time",
+          bad._init_error is not None and "private address" in bad._init_error,
+          f"got {bad._init_error!r}")
+    t0 = _t.monotonic()
+    ok = await bad.start()
+    check("private-address start() fails immediately (<2s, no network)",
+          ok is False and (_t.monotonic() - t0) < 2.0)
+    check("private-address reason lands in last_error",
+          "VPN" in (bad.last_error or "") or "private" in (bad.last_error or ""))
+
+    # 9d. malformed string still caught (regression)
+    ugly = us_mod.UserSession("t", 12345, "abcdef", session_string="garbage-not-a-session")
+    check("malformed string still reported, client still constructed",
+          ugly._init_error is not None and ugly.client is not None)
+
+    # 9e. raw TCP probe: reachable port on localhost + unroutable TEST-NET IP
+    server = await asyncio.start_server(
+        lambda r, w: (w.close()), "127.0.0.1", 0)
+    probe_port = server.sockets[0].getsockname()[1]
+    try:
+        r_ok = await us_mod.UserSession._probe_tcp("127.0.0.1", probe_port, timeout=3)
+        check("probe succeeds against a live listener", r_ok["ok"] is True,
+              f"got {r_ok}")
+        r_dead = await us_mod.UserSession._probe_tcp("192.0.2.1", 443, timeout=1.5)
+        check("probe fails cleanly against unroutable TEST-NET IP",
+              r_dead["ok"] is False and r_dead["error"],
+              f"got {r_dead}")
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    # 9f. dashboard picks up the DC info line (rendering, no network)
+    bot_mod._USER_SESSION_MGR["us"] = good
+    try:
+        html = bot_mod._render_dashboard(cfg, dict(bot_mod._STATE))
+        check("dashboard shows session DC address",
+              "149.154.167.91" in html, "DC info missing from dashboard HTML")
+        good.last_probe = {"host": "149.154.167.91:443", "ok": True, "ms": 42,
+                           "error": None}
+        html2 = bot_mod._render_dashboard(cfg, dict(bot_mod._STATE))
+        check("dashboard shows probe result",
+              "probe" in html2 and "42" in html2)
+    finally:
+        bot_mod._USER_SESSION_MGR["us"] = None
+
+asyncio.run(session_diag_tests())
+
 print()
 print(f"RESULT: {PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

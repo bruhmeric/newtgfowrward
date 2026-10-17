@@ -3,8 +3,65 @@
 This release fixes several real bugs, hardens the webhook server, and tunes
 the bot specifically for Render's free tier (512 MB RAM / 0.1 CPU / 15-min
 sleep / ephemeral disk). All changes are covered by `smoke_test.py`
-(29 checks) and `webhook_e2e_test.py` (19 checks) — run both locally with
+(51 checks) and `webhook_e2e_test.py` (28 checks) — run both locally with
 `pip install -r requirements.txt` first.
+
+---
+
+## Hotfix 3: Telethon connect timeout — diagnose, harden, surface
+
+**Symptom:** the bot itself came up fine (webhook registered, commands
+answered) but the Telethon user session logged
+`Telethon connect timed out after 30s` on every attempt and the dashboard
+could only say "not connected" — with no way to tell a bad `SESSION_STRING`
+from a network problem. Notably the Bot API (HTTPS) worked from the same
+host, so "Telegram is unreachable" was only half the story: a StringSession
+embeds its *own* DC address, and Telethon dials exactly that.
+
+### What was added
+
+1. **Session introspection.** After parsing `SESSION_STRING`, the bot now
+   logs and shows **which datacenter the session dials** (`DC4 ·
+   149.154.167.91:443`) and whether the auth key is the expected 256 bytes.
+   None of this is secret; the key itself never leaves the process.
+2. **Raw TCP probe before every connect attempt.** An 8 s `asyncio`
+   connect to the session's DC — independent of Telethon — answers the
+   question a timeout cannot. On failure it sweeps all five official DCs
+   (once per process) and writes a **verdict**:
+   - *some DCs reachable, the session's is not* → the string points
+     somewhere this host can't reach → regenerate it;
+   - *no DC reachable at all* → MTProto egress is blocked on this network
+     (the Bot API over HTTPS still works — which is why the bot is fine);
+   - *TCP fine but Telethon still times out* → the handshake is stalling
+     on a corrupt auth key → regenerate the string.
+3. **Private-address fast-fail.** A string generated behind a VPN/proxy
+   can embed a private IP (10.x/127.x/192.168.x). That can never connect
+   from a public host; the bot now refuses it at parse time with
+   `SESSION_STRING embeds a private address (…)` instead of burning a
+   60 s timeout per retry forever.
+4. **Dashboard + `/health` surfacing.** The Telethon card gains a second
+   line with the DC and probe result; `/health` gains `telethon_dc:`,
+   `telethon_probe:` and `telethon_verdict:` lines — the whole diagnosis
+   is now readable from `curl https://…/health` alone.
+5. **Connect hardening.** Timeout 30 s → 60 s (cold 0.1-CPU instances
+   need it; override with `TELETHON_CONNECT_TIMEOUT`), explicit
+   `use_ipv6=False` (blackholed IPv6 routes hang connects), internal
+   Telethon retries trimmed to 3 so failures surface to our own backoff
+   loop instead of hanging inside attempt #1, and a 10 s settle delay
+   before the first attempt so the connect doesn't race webhook
+   registration and the PTB update backlog.
+6. **`login.py` now prints the DC** the generated string embeds and warns
+   immediately if it's a private address — the "will this string ever work
+   on Render" check happens before the string ever leaves your machine.
+
+### Tests
+
+- `smoke_test.py` **51/51** — 18 new checks: address classification
+  (telegram/private/public/hostname/unknown), session introspection,
+  private-address fast-fail (< 2 s, no network), malformed-string
+  regression, live TCP probe against a local listener, probe failure
+  against an unroutable TEST-NET IP, and dashboard rendering of the new
+  DC/probe line.
 
 ---
 

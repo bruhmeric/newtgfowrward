@@ -65,7 +65,7 @@ async def verify_session_string(api_id: int, api_hash: str) -> None:
     if us._init_error:
         print(f"FAIL: {us._init_error}")
         sys.exit(1)
-    print("Parsed OK — connecting to Telegram (30s timeout)...")
+    print(f"Parsed OK — connecting to Telegram ({UserSession.CONNECT_TIMEOUT}s timeout)...")
 
     ok = await us.start()
     try:
@@ -140,6 +140,29 @@ async def main() -> None:
 
     if args.string:
         session_string = client.session.save()
+        # Show WHICH datacenter the string embeds — if it was generated behind
+        # a VPN/proxy it may contain an address that will never work from a
+        # public host like Render. Catch that HERE, before the string ever
+        # leaves this machine.
+        try:
+            from user_session import classify_session_address
+            parsed = StringSession(session_string)
+            kind = classify_session_address(parsed.server_address or "")
+            print(f"  Session DC:  DC{parsed.dc_id} ({parsed.server_address}:{parsed.port})")
+            if kind == "private":
+                print()
+                print("  ⚠️  WARNING: this session embeds a PRIVATE address "
+                      f"({parsed.server_address}).")
+                print("  It was generated behind a VPN/proxy and will NEVER work")
+                print("  on a public host like Render. Disconnect the VPN/proxy and")
+                print("  re-run:  python login.py --string")
+            elif kind == "public":
+                print()
+                print("  ⚠️  NOTE: this address is not a known Telegram DC IP —")
+                print("  if the bot can't connect on Render, regenerate the string")
+                print("  with:  python login.py --string")
+        except Exception:
+            pass  # diagnostics must never block printing the string itself
         print()
         print("=" * 70)
         print("  SESSION_STRING (copy this ENTIRE line, including '1' prefix):")
@@ -156,6 +179,13 @@ async def main() -> None:
         print()
         print("  ⚠️  Treat this string like a password — it grants full")
         print("  access to your Telegram account.")
+        print()
+        print("  IMPORTANT: generate this on a NORMAL connection (no VPN/proxy)")
+        print("  and with the SAME API_ID/API_HASH you set on Render — the")
+        print("  session is bound to both.")
+        print()
+        print("  Verify BEFORE pasting into Render:")
+        print("    SESSION_STRING=<string> API_ID=... API_HASH=... python login.py --verify")
     else:
         print(f"\n  Session file: {session_name}.session")
         print("\n  You can now run `python bot.py` — it will reuse this session "

@@ -526,12 +526,16 @@ This is the *expected* degraded mode when `SESSION_STRING` is bad — the bot
 itself (webhook, commands, direct forwarding) keeps running while Telethon
 retries in the background (30 s → 60 s → 120 s → every 5 min). The card on
 the dashboard and the `telethon:` line in `/health` always show the exact
-reason:
+reason, plus **which datacenter the session dials** (`DC4 · 149.154.167.91:443`)
+and the result of a raw TCP reachability probe — run *before* each connect
+attempt — so the cause is visible without opening the logs:
 
 | Reason on the dashboard | What it means | Fix |
 |---|---|---|
 | `SESSION_STRING is malformed` | copy/paste error, quotes, or truncated | re-copy the full string from `python login.py --string` |
-| `connection timed out after 30s` | Telegram unreachable from the host, or the string is corrupt | run `python login.py --verify`; if it fails there too, regenerate |
+| `SESSION_STRING embeds a private address` | the string was generated behind a VPN/proxy — it dials an address no public host can reach | disconnect the VPN and regenerate: `python login.py --string` |
+| `connection to DCx (…) timed out after 60s … Probe verdict: …` | see the verdict on the same line — it names whether the host can't reach MTProto at all, or only the session's DC | run `python login.py --verify`; if it fails there too, regenerate |
+| `… raw TCP probe reached … — the hang is in the MTProto handshake: likely a corrupt auth key` | TCP works, the key doesn't | regenerate the string (its auth key is damaged) |
 | `SESSION_STRING is invalid, expired, or was revoked` | you logged in again elsewhere or terminated the session | generate a fresh string with `python login.py --string` |
 | `not configured — …` | `API_ID`/`API_HASH`/`SESSION_STRING` missing | set the listed variables in Render → Environment |
 
