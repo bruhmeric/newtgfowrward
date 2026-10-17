@@ -1,0 +1,72 @@
+# Render Blueprint — deploys the Telegram Forwarder Bot to Render's free tier.
+#
+# How to use:
+#   1. Push this repo to GitHub
+#   2. Go to https://dashboard.render.com -> New -> Blueprint
+#   3. Select your repo. Render reads render.yaml and creates the service.
+#   4. Set the secret env vars (BOT_TOKEN, API_ID, ...) in the dashboard
+#      when prompted — everything else works out of the box.
+#
+#      NOTE: You no longer need to set WEBHOOK_URL! Render injects
+#      RENDER_EXTERNAL_URL into every web service and the bot uses it
+#      automatically, so the FIRST deploy succeeds immediately.
+#
+# Free-tier behavior (all handled by the bot itself):
+#   * KEEP_ALIVE is on by default — the bot self-pings its public URL every
+#     ~9 minutes so Render never spins it down after 15 min of idleness.
+#     (Set KEEP_ALIVE=false if you'd rather use an external pinger or let
+#     it sleep.)
+#   * 512 MB RAM / 0.1 CPU — the bot now stays well under (RSS ~120-180 MB)
+#   * Ephemeral disk — StringSession + /tmp SQLite + automatic topic-cache
+#     rebuild on every boot mean nothing important is lost on restarts.
+
+services:
+  - type: web
+    name: telegram-forwarder-bot
+    runtime: python
+    plan: free
+    # Choose the region closest to your users (oregon / ohio / frankfurt / singapore)
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    # Auto-deploy when you push to your default branch
+    autoDeploy: true
+    # Health check path — the bot binds the port BEFORE the Telegram
+    # handshake, so this passes within a second of container start.
+    healthCheckPath: /
+    envVars:
+      # ===== Mode (REQUIRED) — must be webhook for Render =====
+      - key: MODE
+        value: webhook
+      # ===== Secrets — set these in Render dashboard after first deploy =====
+      # sync: false means Render won't try to generate a value, you must enter it
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SESSION_STRING
+        sync: false
+      - key: DESTINATION_GROUP_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      # ===== Webhook URL =====
+      # OPTIONAL: leave unset and the bot uses Render's injected
+      # RENDER_EXTERNAL_URL (https://<service>.onrender.com) automatically.
+      # Only set WEBHOOK_URL if you proxy the service behind a custom domain.
+      - key: WEBHOOK_URL
+        sync: false
+      # ===== Keep-alive (prevents the 15-min free-tier spin-down) =====
+      # on by default in webhook mode; ping every ~9 minutes
+      - key: KEEP_ALIVE
+        value: "true"
+      - key: KEEP_ALIVE_INTERVAL
+        value: "540"
+      # ===== DB on ephemeral disk — rebuilt automatically on restart =====
+      - key: DB_PATH
+        value: /tmp/forwarder.db
+      # ===== Python version (must match .python-version file) =====
+      - key: PYTHON_VERSION
+        value: "3.12.0"

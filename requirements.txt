@@ -1,0 +1,24 @@
+# Telegram Forwarder Bot — dependencies
+# Tested with Python 3.12
+#
+# OPTIMIZED FOR RENDER FREE TIER (512 MB RAM / 0.1 CPU):
+#   * python-telegram-bot WITHOUT the [webhooks] extra — we run our own
+#     aiohttp webhook server, so tornado is not needed. Dropping it saves
+#     ~10 MB of RAM and noticeable install time on Render's free builder.
+#   * All versions pinned exactly so Render builds are reproducible and
+#     can't break overnight when a new major release ships.
+#   * cryptg is a prebuilt wheel — speeds up Telethon's AES crypto ~5x,
+#     which matters a lot on the 0.1 CPU free instance.
+python-telegram-bot==21.11.1
+Telethon==1.40.0
+aiosqlite==0.20.0
+python-dotenv==1.0.1
+# Custom webhook server — listens on $PORT, serves GET / (200 OK for the
+# Render health check) AND POST /<secret-path> (forwards updates to PTB).
+# This replaces PTB's built-in tornado server in webhook mode because PTB's
+# server returns 404 for paths other than the webhook path, which causes
+# Render's health check to fail with "Timed out waiting for successful
+# response code".
+aiohttp==3.12.15
+# Speeds up Telethon's encryption significantly (prebuilt wheel, no compile)
+cryptg==0.6.0
