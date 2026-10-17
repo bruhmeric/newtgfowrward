@@ -222,3 +222,69 @@ scrapes on the 0.1-CPU instance.
   surface the error, and still shut down cleanly)
 
 Run them: `python smoke_test.py && python webhook_e2e_test.py`
+
+---
+
+# Hotfix 3 — "stuck at 3/5 setup-storage, bot doesn't respond"
+
+**Symptom (production):** dashboard showed `Startup phase: 3/5 setup-storage`,
+`Startup attempt: 3`, `Telethon session: not configured` forever; the bot
+never answered a single message despite `BOT_TOKEN` being valid.
+
+**Root cause:** the Telethon user session was started SYNCHRONOUSLY inside
+`post_init` (phase 3/5). Telethon's `connect()` / `is_user_authorized()`
+have **no built-in timeout** — with a bad/unreachable `SESSION_STRING` the
+call hung for the full 90 s per-phase timeout, the attempt failed, and the
+retry loop repeated the same hang forever. An *optional* component
+(locked-channel access + topic discovery) was therefore able to block the
+*required* component (the bot itself) from ever registering its webhook.
+
+## Fixes
+
+1. **Telethon is fully decoupled from startup.** It now connects in a
+   background loop with its own retry/backoff (30 s → 60 s → 120 s → 5 min).
+   The bot reaches `ready` and answers messages even when the session string
+   is complete garbage; the dashboard Telethon card shows the exact reason
+   and the retry countdown, and `/health` gains a `telethon:` line.
+2. **Timeouts inside `UserSession.start()`.** `connect()` capped at 30 s
+   (`TELETHON_CONNECT_TIMEOUT`), authorization check at 20 s — a hang is now
+   a clean, explainable failure instead of a frozen startup. Failure paths
+   force-disconnect so half-open sockets are not leaked.
+3. **Malformed `SESSION_STRING` handled.** `StringSession(...)` construction
+   used to raise *outside* any try/except (crashing startup with an opaque
+   KeyError-style error). It now produces a dashboard-ready message
+   ("SESSION_STRING is malformed — copy the ENTIRE string printed by
+   `python login.py --string`").
+4. **Fresh-session entity warmup (the next bug you'd have hit).**
+   `StringSession` — the only session type that survives Render's ephemeral
+   disk — does NOT persist Telethon's entity cache, so on every fresh boot,
+   resolving the destination group by numeric ID failed with
+   "Could not find the input entity": forwarding and topic discovery would
+   have silently failed even with a VALID session string. The bot now warms
+   the entity cache with the account's dialogs right after connecting (and
+   lazily on first resolve failure).
+5. **`Config.has_user_session` is honest.** API_ID+API_HASH alone (or with
+   the repo's empty placeholder `user_session.session`) no longer count as
+   "a session is configured" — previously the bot kept trying to connect a
+   session that could never exist.
+6. **Non-numeric env values no longer crash `Config.load()`** (a typo'd
+   `API_ID`/`DESTINATION_GROUP_ID`/`PORT` used to cause a Render crash
+   loop). Bad values are ignored, logged, and shown in a "Configuration
+   warnings" box on the dashboard.
+7. **`UserSession.stop()` force-disconnects** (the old `if self._started`
+   guard leaked connections when start() was cancelled mid-handshake), and
+   startup-attempt teardown no longer disconnects a healthy session when an
+   unrelated phase fails.
+8. **`login.py --verify`** — validate an existing SESSION_STRING locally
+   (parse → connect → authorized) *before* pasting it into Render.
+
+## Tests
+
+- `webhook_e2e_test.py` **28/28** — new scenario 3 regression: a UserSession
+  whose `start()` hangs forever must NOT prevent `ready: True`, webhook
+  registration, or update dispatch; SIGTERM cancels the hung loop cleanly.
+  (The scenario also caught a real `KeyError: 'user_session'` bug in the
+  rework before it shipped.)
+- `smoke_test.py` **33/33** — new checks: api credentials alone do not count
+  as a session; SESSION_STRING enables it; a non-numeric API_ID disables the
+  session with a visible load issue instead of raising.

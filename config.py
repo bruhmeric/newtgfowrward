@@ -50,6 +50,29 @@ def _int_list(value: str) -> list[int]:
     return result
 
 
+def _file_session_has_auth(path: str) -> bool:
+    """True if a Telethon .session file exists AND contains an auth key.
+
+    The repo ships an EMPTY placeholder user_session.session — on a fresh
+    clone (or a Render deploy, where the disk is ephemeral) that file has no
+    auth key, so it must NOT count as "a session is configured". Otherwise
+    the bot would try to connect with it on every boot and burn CPU on a
+    guaranteed-to-fail login check.
+    """
+    if not os.path.exists(path):
+        return False
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            row = con.execute("SELECT auth_key FROM sessions").fetchone()
+        finally:
+            con.close()
+        return bool(row and row[0])
+    except Exception:
+        return False
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name, "").strip().lower()
     if not raw:
@@ -77,6 +100,9 @@ class Config:
     keep_alive_interval: int = 540     # seconds (9 min < Render's 15-min limit)
     # --- misc tuning ---
     log_level: str = "INFO"
+    # Non-fatal problems noticed while loading env vars (bad numbers etc.) —
+    # surfaced on the web dashboard so a typo doesn't turn into a mystery.
+    load_issues: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls) -> "Config":
@@ -84,12 +110,32 @@ class Config:
         if not token:
             raise RuntimeError("BOT_TOKEN missing — copy .env.example to .env and fill it in.")
 
+        issues: list[str] = []
+
+        api_id: Optional[int] = None
         api_id_raw = os.environ.get("API_ID", "").strip()
-        api_hash = os.environ.get("API_HASH", "").strip()
+        if api_id_raw:
+            try:
+                api_id = int(api_id_raw)
+            except ValueError:
+                # A non-numeric API_ID used to crash Config.load() before the
+                # bot could even boot — turning a typo into a Render crash
+                # loop. Now it disables the user session with a clear reason.
+                issues.append(
+                    "API_ID is set but not a number — get the numeric value from "
+                    "my.telegram.org -> API development tools.")
+        api_hash = os.environ.get("API_HASH", "").strip() or None
         phone = os.environ.get("PHONE", "").strip() or None
 
+        dest: Optional[int] = None
         dest_raw = os.environ.get("DESTINATION_GROUP_ID", "").strip()
-        dest = int(dest_raw) if dest_raw else None
+        if dest_raw:
+            try:
+                dest = int(dest_raw)
+            except ValueError:
+                issues.append(
+                    f"DESTINATION_GROUP_ID is set but not a number (got {dest_raw!r}) "
+                    "— ignoring it. Group IDs look like -1001234567890.")
 
         admin_raw = os.environ.get("ADMIN_IDS", "").strip()
         admins = _int_list(admin_raw) if admin_raw else []
@@ -109,7 +155,13 @@ class Config:
             webhook_url = webhook_url.rstrip("/") or None
 
         port_raw = os.environ.get("PORT", "").strip()
-        port = int(port_raw) if port_raw else 8080
+        port = 8080
+        if port_raw:
+            try:
+                port = int(port_raw)
+            except ValueError:
+                issues.append(f"PORT is set but not a number (got {port_raw!r}) — "
+                              "falling back to 8080.")
 
         session_string = os.environ.get("SESSION_STRING", "").strip() or None
 
@@ -129,7 +181,7 @@ class Config:
 
         return cls(
             bot_token=token,
-            api_id=int(api_id_raw) if api_id_raw else None,
+            api_id=api_id,  # already parsed (None + a load_issue if invalid)
             api_hash=api_hash or None,
             phone=phone,
             destination_group_id=dest,
@@ -143,13 +195,22 @@ class Config:
             keep_alive=_env_bool("KEEP_ALIVE", default=(mode == "webhook")),
             keep_alive_interval=keep_alive_interval,
             log_level=log_level,
+            load_issues=issues,
         )
 
     @property
     def has_user_session(self) -> bool:
-        # Session works if we have api_id+api_hash AND at least one of
-        # (file-based session name, session_string).
-        return bool(self.api_id and self.api_hash)
+        # A usable session needs api credentials AND an actual session: a
+        # SESSION_STRING, or a file session that really contains an auth key
+        # (the repo's placeholder user_session.session does not). Previously
+        # this returned True with only API_ID/API_HASH set, so the bot kept
+        # trying to "connect" a session that could never exist.
+        if not (self.api_id and self.api_hash):
+            return False
+        return bool(
+            self.session_string
+            or _file_session_has_auth(f"{self.session_name}.session")
+        )
 
     def is_admin(self, user_id: int) -> bool:
         if not self.admin_ids:

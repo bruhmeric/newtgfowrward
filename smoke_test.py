@@ -72,6 +72,27 @@ try:
     check("bad ADMIN_IDS entries skipped, not fatal",
           cfg2.admin_ids == [111, 222, 333], f"got {cfg2.admin_ids}")
     check("keep_alive_interval clamped to 840", cfg2.keep_alive_interval == 840)
+
+    # has_user_session: api credentials alone must NOT count as a session
+    # (the repo's placeholder user_session.session has no auth key either).
+    check("api credentials alone do NOT count as a session",
+          cfg2.has_user_session is False,
+          f"has_user_session={cfg2.has_user_session}")
+    os.environ["SESSION_STRING"] = "1SomeSessionString"
+    cfg3 = config_mod.Config.load()
+    check("SESSION_STRING + api credentials count as a session",
+          cfg3.has_user_session is True)
+    del os.environ["SESSION_STRING"]
+
+    # a non-numeric API_ID must disable the session with a visible issue,
+    # not crash Config.load (it used to raise ValueError -> crash loop)
+    os.environ["API_ID"] = "not-a-number"
+    cfg4 = config_mod.Config.load()
+    check("non-numeric API_ID does not crash load()",
+          cfg4.api_id is None and not cfg4.has_user_session)
+    check("non-numeric API_ID surfaces as a load issue",
+          any("API_ID" in i for i in cfg4.load_issues), f"got {cfg4.load_issues}")
+    os.environ["API_ID"] = "12345"
 finally:
     for k, v in old.items():
         if v is None:

@@ -118,10 +118,15 @@ _STATE: dict[str, Any] = {
     "attempts": 0,      # startup attempts this boot
     "bot_username": None,
     "webhook_registered": False,
-    "user_session": "not configured",
+    "user_session": "starting…",
     "wh_info": None,    # cached Telegram get_webhook_info payload
     "wh_info_ts": 0.0,
 }
+
+# Owns the Telethon user-session background lifecycle. The user session is
+# OPTIONAL (locked channels + topic discovery) — it must NEVER be able to
+# block or crash the bot itself. See _user_session_loop.
+_USER_SESSION_MGR: dict[str, Any] = {"task": None, "us": None}
 
 
 def _scrub(cfg: Config, text: Any) -> str:
@@ -185,6 +190,8 @@ _DASHBOARD_CSS = """
   .dim { color:#8b949e; font-weight:400; font-size:12px; }
   .errorbox { background:#20070a; border:1px solid #5a1218; border-radius:10px; padding:14px 16px; margin-bottom:18px; }
   .errorbox pre { margin:0 0 10px; white-space:pre-wrap; word-break:break-all; color:#ff8a8a; font-size:13px; }
+  .errorbox.warn { background:#231d00; border-color:#5a4a12; }
+  .errorbox.warn li { color:#d29922; font-size:13px; margin-bottom:6px; }
   section.env { margin-top:22px; }
   table { border-collapse:collapse; width:100%; background:#161b26; border:1px solid #21262d;
           border-radius:10px; overflow:hidden; font-size:13px; }
@@ -242,7 +249,12 @@ def _render_dashboard(cfg: Config, state: dict) -> str:
         cards.append(card("Startup attempt", esc(str(state.get("attempts", "?")))))
 
     us_status = str(state.get("user_session", "not configured"))
-    us_cls = "ok" if us_status.startswith("connected") else "warn"
+    if us_status.startswith("connected"):
+        us_cls = "ok"
+    elif us_status.startswith("not connected"):
+        us_cls = "err"     # there is a concrete reason — draw the eye
+    else:                   # connecting / starting / not configured
+        us_cls = "warn"
     cards.append(card("Telethon session", f'<span class="{us_cls}">{esc(us_status)}</span>'))
     cards.append(card(
         "Destination group",
@@ -275,6 +287,20 @@ def _render_dashboard(cfg: Config, state: dict) -> str:
             '</section>'
         )
 
+    # Non-fatal config problems (bad numbers etc.) — a warning, not an error:
+    # the bot is running, but a feature may be silently disabled.
+    issues_html = ""
+    if getattr(cfg, "load_issues", None):
+        rows = "".join(f"<li>{esc(i)}</li>" for i in cfg.load_issues)
+        issues_html = (
+            '<section class="errorbox warn">'
+            '<h2>Configuration warnings</h2>'
+            f'<ul style="margin:0;padding-left:18px;">{rows}</ul>'
+            '<p class="dim" style="margin:10px 0 0;">Fix the environment variable in '
+            'Render (your service → Environment), then redeploy.</p>'
+            '</section>'
+        )
+
     def env_row(name: str, present: bool, note: str, optional: bool = False) -> str:
         # Required vars show green "set" / red "MISSING"; optional vars show a
         # neutral "optional" when absent so the checklist doesn't cry wolf.
@@ -290,7 +316,8 @@ def _render_dashboard(cfg: Config, state: dict) -> str:
         env_row("BOT_TOKEN", True, "from @BotFather — required"),
         env_row("API_ID", cfg.api_id is not None, "required for locked-channel forwarding"),
         env_row("API_HASH", bool(cfg.api_hash), "required for locked-channel forwarding"),
-        env_row("SESSION_STRING", bool(cfg.session_string), "generate with: python login.py"),
+        env_row("SESSION_STRING", bool(cfg.session_string),
+                "generate with: python login.py --string"),
         env_row("DESTINATION_GROUP_ID", cfg.destination_group_id is not None,
                 f"current value: {cfg.destination_group_id}" if cfg.destination_group_id
                 else "or set later via /setgroup", optional=True),
@@ -313,7 +340,7 @@ def _render_dashboard(cfg: Config, state: dict) -> str:
         '<header><h1>Telegram Forwarder Bot</h1>'
         f'<span class="badge {badge_cls}">{badge}</span>'
         '<span class="dim">refreshes every 5 s</span></header>'
-        f'{error_html}'
+        f'{error_html}{issues_html}'
         f'<div class="grid">{"".join(cards)}</div>'
         '<section class="env"><h2>Environment variables (Render → your service → Environment)</h2>'
         f'<table><tr><th>Variable</th><th>Status</th><th>Notes</th></tr>{env_rows}</table></section>'
@@ -328,6 +355,80 @@ def _render_dashboard(cfg: Config, state: dict) -> str:
 # ---------------------------------------------------------------------------
 # Application lifecycle hooks (called by PTB in both polling and webhook mode)
 # ---------------------------------------------------------------------------
+
+async def _user_session_loop(app: Application, cfg: Config) -> None:
+    """Connect the Telethon user session in the BACKGROUND, retrying forever.
+
+    This used to run synchronously inside post_init (phase 3/5). Because
+    Telethon's connect() has no built-in timeout, a SESSION_STRING pointing
+    at an unreachable data center hung the WHOLE startup for the full 90 s
+    per-phase timeout on every attempt — the bot itself never registered its
+    webhook and never answered a single message while the dashboard showed
+    "3/5 setup-storage" forever. The user session is an optional accessory;
+    now it can only fail in the background, with the reason on the dashboard,
+    while the bot comes up normally.
+    """
+    delays = [30, 60, 120, 300]  # backoff between retries, capped at 5 min
+    attempt = 0
+    while True:
+        attempt += 1
+        us = UserSession(
+            cfg.session_name, cfg.api_id, cfg.api_hash,
+            session_string=cfg.session_string,
+        )
+        _USER_SESSION_MGR["us"] = us
+        _STATE["user_session"] = f"connecting (attempt {attempt})…"
+        ok = await us.start()
+        if ok:
+            app.bot_data["user_session"] = us
+            topics_mgr = app.bot_data.get("topics")
+            if topics_mgr is not None:
+                topics_mgr.user_session = us  # late attach (manager may be newer)
+            _STATE["user_session"] = f"connected as {us.connected_as or '?'}"
+            logger.info("Telethon user session attached (attempt %d)", attempt)
+            # Rebuild the topic cache after ephemeral-disk restarts so the
+            # topic picker works immediately without a manual /refresh.
+            try:
+                gid = cfg.destination_group_id
+                if gid is not None:
+                    db: Database = app.bot_data["db"]
+                    cached = await db.get_all_topics(gid)
+                    if not cached:
+                        topics = await us.list_forum_topics(gid)
+                        if topics:
+                            await db.set_cached_topics(gid, topics)
+                            logger.info("Auto-refreshed %d forum topic(s) for %d",
+                                        len(topics), gid)
+            except Exception:
+                logger.debug("post-connect topic refresh failed", exc_info=True)
+            return  # connected — Telethon's auto-reconnect handles blips
+
+        # Failed — surface the reason on the dashboard and retry later.
+        app.bot_data["user_session"] = None
+        reason = us.last_error or "unknown reason"
+        delay = delays[min(attempt - 1, len(delays) - 1)]
+        _STATE["user_session"] = (
+            f"not connected — {reason} (retry #{attempt + 1} in {delay}s)")
+        logger.warning(
+            "Telethon user session unavailable (attempt %d): %s — retrying in %ds. "
+            "The bot itself keeps running; only locked-channel forwarding and "
+            "topic discovery are affected.", attempt, reason, delay)
+        try:
+            await us.stop()
+        except Exception:
+            pass
+        await asyncio.sleep(delay)
+
+
+def _ensure_user_session_loop(app: Application, cfg: Config) -> None:
+    """Start the background Telethon loop exactly once per process (post_init
+    can be re-run by the startup retry loop; a second loop would create a
+    duplicate client)."""
+    task = _USER_SESSION_MGR["task"]
+    if task is not None and not task.done():
+        return
+    _USER_SESSION_MGR["task"] = asyncio.create_task(_user_session_loop(app, cfg))
+
 
 async def post_init(app: Application) -> None:
     """Called after the Application is fully initialised, before polling starts."""
@@ -350,58 +451,35 @@ async def post_init(app: Application) -> None:
         except ValueError:
             pass
 
-    user_session: UserSession | None = None
     if cfg.has_user_session:
-        user_session = UserSession(
-            cfg.session_name, cfg.api_id, cfg.api_hash,
-            session_string=cfg.session_string,
-        )
-        ok = await user_session.start()
-        if ok:
-            app.bot_data["user_session"] = user_session
-            _STATE["user_session"] = f"connected as {user_session.connected_as or '?'}"
-        else:
-            app.bot_data["user_session"] = None
-            _STATE["user_session"] = (
-                f"not connected — {user_session.last_error or 'unknown reason'}")
-            logger.warning(
-                "Telethon session unavailable (%s). Locked-channel forwarding and "
-                "topic auto-discovery will not work until you log in.",
-                user_session.last_error,
-            )
+        # Telethon connects in the BACKGROUND with its own retry loop — a bad
+        # or unreachable SESSION_STRING must never block or crash the bot
+        # itself (this used to freeze phase 3/5 for 90 s per attempt).
+        if _USER_SESSION_MGR["task"] is None or _USER_SESSION_MGR["task"].done():
+            _STATE["user_session"] = "connecting…"
+        _ensure_user_session_loop(app, cfg)
     else:
         app.bot_data["user_session"] = None
-        _STATE["user_session"] = "not configured (set API_ID + API_HASH + SESSION_STRING)"
-        logger.info("Telethon not configured (API_ID/API_HASH missing). "
-                    "Only direct forwarding will work.")
+        missing = [n for n, ok in (
+            ("API_ID", cfg.api_id is not None),
+            ("API_HASH", bool(cfg.api_hash)),
+            ("SESSION_STRING", bool(cfg.session_string)),
+        ) if not ok]
+        # (file-based local dev sessions also count as configured — see
+        # Config.has_user_session — so this branch means "nothing to log in
+        # with"; say exactly which variable is missing.)
+        if not cfg.api_id or not cfg.api_hash:
+            detail = "set API_ID + API_HASH (+ SESSION_STRING on Render)"
+        else:
+            detail = "set SESSION_STRING (generate with: python login.py --string)"
+        _STATE["user_session"] = f"not configured — {detail}"
+        logger.info("Telethon not configured (missing: %s). Only direct "
+                    "forwarding will work.", ", ".join(missing) or "n/a")
 
-    app.bot_data["topics"] = TopicManager(db, app.bot_data["user_session"])
+    # NOTE: .get(), not [] — with a StringSession the Telethon client is
+    # attached LATER by the background loop, so the key may not exist yet.
+    app.bot_data["topics"] = TopicManager(db, app.bot_data.get("user_session"))
     app.bot_data["started_at"] = _STARTED_AT  # for /status uptime display
-
-    # After a restart on ephemeral storage the topic cache is empty. If we
-    # have a Telethon session and a destination group, rebuild the cache in
-    # the background so the topic picker works immediately — the user no
-    # longer has to remember to run /refresh after every deploy.
-    async def _background_topic_refresh() -> None:
-        try:
-            await asyncio.sleep(2)  # let startup finish first
-            gid = cfg.destination_group_id
-            if gid is None:
-                return
-            cached = await db.get_all_topics(gid)
-            if cached:
-                return  # cache survived (non-ephemeral disk) — nothing to do
-            if not (user_session and user_session.available):
-                return
-            topics = await user_session.list_forum_topics(gid)
-            if topics:
-                await db.set_cached_topics(gid, topics)
-                logger.info("Auto-refreshed %d forum topic(s) for %d",
-                            len(topics), gid)
-        except Exception:
-            logger.debug("Background topic refresh failed", exc_info=True)
-
-    asyncio.create_task(_background_topic_refresh())
 
     me = await app.bot.get_me()
     _STATE["bot_username"] = me.username
@@ -420,12 +498,30 @@ async def post_init(app: Application) -> None:
 
 
 async def post_stop(app: Application) -> None:
+    # Stop the background Telethon loop + its session (owned at module level —
+    # it is independent of PTB's lifecycle and would otherwise keep running).
+    task = _USER_SESSION_MGR["task"]
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    us = _USER_SESSION_MGR.get("us")
+    if us is not None:
+        try:
+            await us.stop()
+        except Exception:
+            pass
+    us2: UserSession | None = app.bot_data.get("user_session")
+    if us2 is not None and us2 is not us:
+        try:
+            await us2.stop()
+        except Exception:
+            pass
     db: Database = app.bot_data.get("db")
     if db:
         await db.close()
-    us: UserSession | None = app.bot_data.get("user_session")
-    if us:
-        await us.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +662,7 @@ async def _run_webhook_custom(app: Application, cfg: Config) -> None:
     state.update({
         "ready": False, "phase": "1/5 bind-port", "error": None, "hint": None,
         "attempts": 0, "bot_username": None, "webhook_registered": False,
-        "user_session": "not configured", "wh_info": None, "wh_info_ts": 0.0,
+        "user_session": "starting…", "wh_info": None, "wh_info_ts": 0.0,
     })
 
     async def refresh_webhook_info(force: bool = False) -> None:
@@ -608,6 +704,10 @@ async def _run_webhook_custom(app: Application, cfg: Config) -> None:
             if state["error"]:
                 body += f"error: {_scrub(cfg, state['error'])}\n"
                 body += f"hint: {state['hint']}\n"
+        # The Telethon user session runs independently of the bot — surface
+        # its state so "ready: True" + "telethon: not connected" is not a
+        # mystery (locked channels/topics will be unavailable, nothing else).
+        body += f"telethon: {_scrub(cfg, str(state.get('user_session', '?')))}\n"
         body += f"rss_mb: {_rss_mb():.0f}\n"
         return web.Response(text=body, status=200, content_type="text/plain")
 
@@ -712,15 +812,13 @@ async def _run_webhook_custom(app: Application, cfg: Config) -> None:
     async def _teardown_attempt() -> None:
         """Best-effort cleanup of a failed attempt so the next one starts
         clean. PTB's initialize() is a no-op when already initialized and
-        shutdown() resets that flag; the Telethon client must be explicitly
-        disconnected; the DB stays open (its init() is idempotent)."""
-        us = app.bot_data.get("user_session")
-        if us is not None:
-            try:
-                await us.stop()
-            except Exception:
-                pass
-            app.bot_data["user_session"] = None
+        shutdown() resets that flag; the DB stays open (its init() is
+        idempotent).
+
+        NOTE: the Telethon user session is deliberately NOT touched here —
+        it lives in its own background loop (_USER_SESSION_MGR) and survives
+        startup retries; tearing it down would disconnect a perfectly healthy
+        session because an UNRELATED phase (e.g. set_webhook) hiccuped."""
         try:
             if app.running:
                 await app.stop()

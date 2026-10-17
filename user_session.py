@@ -11,6 +11,7 @@ prompt interactively.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import os
@@ -126,14 +127,37 @@ def parse_channel_link(url: str) -> Optional[ParsedLink]:
 # ---------- session manager ----------
 
 class UserSession:
+    # Telethon's connect()/is_user_authorized() have NO built-in timeout — a
+    # session string pointing at an unreachable data center (or a network
+    # black hole) hangs FOREVER. These ceilings turn a hang into a clean,
+    # explainable failure that the bot can show on its dashboard.
+    CONNECT_TIMEOUT = int(os.environ.get("TELETHON_CONNECT_TIMEOUT", "30"))
+    AUTH_CHECK_TIMEOUT = 20
+    RPC_TIMEOUT = 20
+
     def __init__(self, session_name: str, api_id: int, api_hash: str,
                  session_string: Optional[str] = None) -> None:
         """Create a Telethon client backed by either a file-based session
         (session_name) or a StringSession (session_string). StringSession is
         preferred for ephemeral filesystems like Render's free tier."""
+        self._init_error: Optional[str] = None
+        self._dialogs_warmed = 0
         if session_string:
             from telethon.sessions import StringSession
-            self.client = TelegramClient(StringSession(session_string), api_id, api_hash)
+            try:
+                session_obj = StringSession(session_string)
+            except Exception as e:
+                # A malformed SESSION_STRING used to blow up here, OUTSIDE any
+                # try/except, crashing the whole startup. Now it becomes a
+                # clear dashboard message instead.
+                self._init_error = (
+                    f"SESSION_STRING is malformed ({type(e).__name__}) — copy the "
+                    "ENTIRE string printed by: python login.py --string")
+                logger.error("%s", self._init_error)
+                # Build the client with a blank StringSession so self.client is
+                # always a valid TelegramClient; start() refuses to use it.
+                session_obj = StringSession()
+            self.client = TelegramClient(session_obj, api_id, api_hash)
             self._uses_string_session = True
         else:
             self.client = TelegramClient(session_name, api_id, api_hash)
@@ -148,37 +172,128 @@ class UserSession:
     async def start(self) -> bool:
         """Connect using an existing session. Returns False if no session
         exists or the session is invalid. Callers should NOT call interactive
-        login here — that's done by login.py."""
+        login here — that's done by login.py.
+
+        Every network step is wrapped in a timeout so this method ALWAYS
+        returns (True/False) within ~CONNECT_TIMEOUT+AUTH_CHECK_TIMEOUT
+        seconds — it can no longer hang a caller forever (which used to
+        freeze the whole bot startup)."""
         self.last_error = None
+        if self._init_error:
+            self.last_error = self._init_error
+            return False
         if not self._uses_string_session and not os.path.exists(self.session_filename):
             logger.warning("Telethon session file missing — run python login.py first.")
             self.last_error = "no session file and no SESSION_STRING set — run login.py"
             return False
         try:
-            await self.client.connect()
-            if not await self.client.is_user_authorized():
-                logger.warning("Telethon session exists but is not authorized.")
-                await self.client.disconnect()
-                self.last_error = ("SESSION_STRING is invalid, expired, or was "
-                                   "revoked — generate a fresh one with login.py")
-                return False
-            self._started = True
-            self.connected_as = await self._safe_get_me()
-            logger.info("Telethon user session connected as %s (mode=%s)",
-                        self.connected_as,
-                        "string" if self._uses_string_session else "file")
-            return True
-        except Exception as e:
-            logger.exception("Failed to start Telethon client")
-            self.last_error = f"{type(e).__name__}: {e}"
+            await asyncio.wait_for(self.client.connect(), timeout=self.CONNECT_TIMEOUT)
+        except asyncio.TimeoutError:
+            await self._force_disconnect()
+            self.last_error = (
+                f"connection timed out after {self.CONNECT_TIMEOUT}s — Telegram is "
+                "unreachable from this host, or the SESSION_STRING is corrupt")
+            logger.warning("Telethon connect timed out after %ss", self.CONNECT_TIMEOUT)
             return False
+        except Exception as e:
+            await self._force_disconnect()
+            self.last_error = f"{type(e).__name__}: {e}"
+            logger.warning("Telethon connect failed: %s", self.last_error)
+            return False
+        try:
+            authorized = await asyncio.wait_for(
+                self.client.is_user_authorized(), timeout=self.AUTH_CHECK_TIMEOUT)
+        except asyncio.TimeoutError:
+            await self._force_disconnect()
+            self.last_error = (
+                f"authorization check timed out after {self.AUTH_CHECK_TIMEOUT}s — "
+                "the SESSION_STRING is probably invalid or revoked")
+            logger.warning("Telethon auth check timed out")
+            return False
+        except Exception as e:
+            await self._force_disconnect()
+            self.last_error = f"{type(e).__name__}: {e}"
+            logger.warning("Telethon auth check failed: %s", self.last_error)
+            return False
+        if not authorized:
+            await self._force_disconnect()
+            self.last_error = ("SESSION_STRING is invalid, expired, or was "
+                               "revoked — generate a fresh one with: python login.py --string")
+            logger.warning("Telethon session exists but is not authorized.")
+            return False
+        self._started = True
+        self.connected_as = await self._safe_get_me()
+        logger.info("Telethon user session connected as %s (mode=%s)",
+                    self.connected_as,
+                    "string" if self._uses_string_session else "file")
+        # Warm the entity cache in the background — see _warm_entity_cache.
+        # Non-blocking: the session is usable immediately; numeric IDs get
+        # resolvable a couple of seconds later.
+        asyncio.get_running_loop().create_task(self._warmup_task())
+        return True
+
+    async def _warmup_task(self) -> None:
+        """Background dialog warmup launched by start(); failures are
+        non-fatal (the lazy fallback in _get_entity_with_warmup retries)."""
+        try:
+            await self._warm_entity_cache()
+        except Exception:
+            logger.debug("background dialog warmup failed", exc_info=True)
+
+    async def _warm_entity_cache(self) -> int:
+        """Fetch the account's dialogs once so numeric chat IDs resolve.
+
+        StringSession — the only session type that survives Render's
+        ephemeral disk — does NOT persist Telethon's entity cache. On every
+        fresh boot, resolving a numeric ID like -1004372538320 fails with
+        "Could not find the input entity" until the dialogs are fetched
+        once. Without this warmup, topic discovery AND forwarding to the
+        destination group silently fail after every restart.
+        """
+        if self._dialogs_warmed:
+            return self._dialogs_warmed
+        count = 0
+        async for _dialog in self.client.iter_dialogs(limit=200):
+            count += 1
+        self._dialogs_warmed = count
+        logger.info("Entity cache warmed with %d dialog(s)", count)
+        return count
+
+    async def _get_entity_with_warmup(self, ref):
+        """get_entity() with a one-shot dialog warmup for fresh sessions.
+
+        Raises the second failure if warmup doesn't fix resolution — callers
+        already have good error reporting around their get_entity calls."""
+        try:
+            return await self.client.get_entity(ref)
+        except Exception as first_err:
+            if self._dialogs_warmed:
+                raise
+            logger.info("Entity %r not in cache (%s) — warming dialogs once...",
+                        ref, type(first_err).__name__)
+            try:
+                warmed = await asyncio.wait_for(
+                    self._warm_entity_cache(), timeout=self.RPC_TIMEOUT + 15)
+            except asyncio.TimeoutError:
+                raise first_err
+            if not warmed:
+                raise first_err
+            return await self.client.get_entity(ref)
 
     async def _safe_get_me(self) -> str:
         try:
-            me = await self.client.get_me()
+            me = await asyncio.wait_for(self.client.get_me(), timeout=self.RPC_TIMEOUT)
             return f"@{me.username} ({me.id})" if me else "?"
         except Exception:
             return "?"
+
+    async def _force_disconnect(self) -> None:
+        """Best-effort disconnect that NEVER hangs and never raises — used on
+        failure paths so a half-open connection is not leaked."""
+        try:
+            await asyncio.wait_for(self.client.disconnect(), timeout=10)
+        except Exception:
+            logger.debug("force disconnect failed (ignored)", exc_info=True)
 
     @property
     def session_filename(self) -> str:
@@ -193,13 +308,20 @@ class UserSession:
             return "user_session.session"
 
     async def stop(self) -> None:
-        if self._started:
-            await self.client.disconnect()
-            self._started = False
+        """Disconnect unconditionally. The old `if self._started` guard leaked
+        connections whenever start() was interrupted mid-handshake (e.g. a
+        cancelled connect after a timeout) — _started was never set but the
+        socket was half-open."""
+        try:
+            if self.client.is_connected():
+                await asyncio.wait_for(self.client.disconnect(), timeout=10)
+        except Exception:
+            logger.debug("stop(): disconnect failed (ignored)", exc_info=True)
+        self._started = False
 
     @property
     def available(self) -> bool:
-        return self._started
+        return self._started and self.client.is_connected()
 
     # ---------- forum topic enumeration ----------
 
@@ -207,9 +329,13 @@ class UserSession:
         """Return list of {'id': int, 'title': str} for all forum topics except
         the General topic (id=1)."""
         try:
+            # Resolve via get_entity (network) with the fresh-session warmup
+            # fallback — get_input_entity alone only reads the cache, which is
+            # EMPTY on every fresh StringSession boot (see _warm_entity_cache).
+            await self._get_entity_with_warmup(chat_id)
             peer = await self.client.get_input_entity(chat_id)
         except Exception:
-            logger.exception("get_input_entity failed for chat_id=%s", chat_id)
+            logger.exception("could not resolve chat_id=%s", chat_id)
             return []
 
         topics: list[dict] = []
@@ -279,11 +405,13 @@ class UserSession:
                 # network call to resolve unknown entities (e.g. channels the
                 # user just joined that aren't in Telethon's session cache).
                 # get_input_entity only uses the cache and can fail for new
-                # channels.
-                entity = await self.client.get_entity(chat_id)
+                # channels. _get_entity_with_warmup additionally fetches the
+                # dialog list once on fresh StringSessions (whose entity cache
+                # starts EMPTY on every deploy).
+                entity = await self._get_entity_with_warmup(chat_id)
             else:
                 diag.append(f"Step 2: Resolving entity for username={parsed.chat_ref} via Telethon get_entity()...")
-                entity = await self.client.get_entity(parsed.chat_ref)
+                entity = await self._get_entity_with_warmup(parsed.chat_ref)
             diag.append(f"Step 2: ✓ Entity resolved → {type(entity).__name__} (id={getattr(entity, 'id', '?')})")
         except ChannelPrivateError as e:
             diag.append(f"Step 2: ✗ FAILED — ChannelPrivateError: {e}")
@@ -515,9 +643,9 @@ class UserSession:
 
         try:
             if source_entity is None:
-                source_entity = await self.client.get_entity(source_chat_id)
+                source_entity = await self._get_entity_with_warmup(source_chat_id)
             if dest_entity is None:
-                dest_entity = await self.client.get_entity(dest_chat_id)
+                dest_entity = await self._get_entity_with_warmup(dest_chat_id)
             diag.append(f"✓ Resolved source ({type(source_entity).__name__}) and "
                         f"destination ({type(dest_entity).__name__})")
         except Exception as e:
@@ -1317,8 +1445,8 @@ class UserSession:
         }
 
         try:
-            source_entity = await self.client.get_entity(source_chat_ref)
-            dest_entity = await self.client.get_entity(dest_chat_id)
+            source_entity = await self._get_entity_with_warmup(source_chat_ref)
+            dest_entity = await self._get_entity_with_warmup(dest_chat_id)
         except Exception as e:
             if status_callback:
                 await status_callback(f"❌ Failed to resolve entities: {type(e).__name__}: {e}")

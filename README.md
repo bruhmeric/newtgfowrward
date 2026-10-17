@@ -375,12 +375,14 @@ See [Render setup (in original README)](#render-setup-details) below for the ful
 ### Quick start
 
 1. Push the project to GitHub (unzip `telegram-forwarder-bot.zip`, `git init`, push)
-2. Generate SESSION_STRING locally:
+2. Generate SESSION_STRING locally (and verify it BEFORE pasting into Render):
    ```bash
    pip install -r requirements.txt
    cp .env.example .env  # fill in API_ID, API_HASH, PHONE
    python login.py --string
-   # Copy the printed SESSION_STRING
+   # Copy the printed SESSION_STRING into Render's SESSION_STRING env var,
+   # then double-check it with:
+   python login.py --verify   # parses + connects + checks authorization
    ```
 3. Render Dashboard → New → Blueprint → select your repo → Apply
 4. Fill in the secret env vars when prompted: `BOT_TOKEN`, `API_ID`, `API_HASH`, `SESSION_STRING`, `DESTINATION_GROUP_ID`, `ADMIN_IDS`
@@ -406,6 +408,13 @@ page (auto-refreshes every 5 s):
   @BotFather and the Render Environment tab)
 * **Live stats** — uptime, memory vs the 512 MB free-tier limit, mode,
   bot username, Telethon session state, destination group
+* **Telethon session card** — `connected as @you`, or the exact reason it
+  is not (`SESSION_STRING is malformed / timed out / revoked`), with the
+  background retry countdown. A broken session disables only locked-channel
+  forwarding and topic discovery — the bot itself keeps working
+* **Configuration warnings** — non-fatal problems like a non-numeric
+  `API_ID` are listed in a warning box instead of silently disabling a
+  feature
 * **Telegram webhook diagnostics** — pending update count and the last
   delivery error straight from `get_webhook_info`
 * **Environment checklist** — which of `BOT_TOKEN`, `API_ID`, `API_HASH`,
@@ -424,11 +433,15 @@ returns plain text:
 OK
 uptime_sec: 1234
 ready: True
+telethon: connected as @you (123456)
 rss_mb: 142
 ```
 
 and when the bot is not up yet, `phase:`, `error:` and `hint:` lines are
-included so even a curl tells you what's wrong.
+included so even a curl tells you what's wrong. The `telethon:` line always
+shows the user-session state — `ready: True` with `telethon: not connected`
+means the bot works but locked-channel forwarding / topic discovery are
+unavailable until the session connects.
 
 <a id="render-setup-details"></a>
 
@@ -502,7 +515,28 @@ telegram-forwarder-bot/
 
 - Send `/test_link <url>` — the bot shows a step-by-step diagnostic of where it failed
 - Most common: your user account is not a member of the source channel → `ChannelPrivateError`
+- If the dashboard says `Telethon session: not connected — …`, the user session
+  isn't up: run `python login.py --verify` locally against the same
+  `SESSION_STRING`, fix it in Render → Environment, redeploy
 - If you see `ChatForwardsRestrictedError` → the bot should fall through to the third-tier fallback (download + re-upload). If it doesn't, send the diagnostic to me.
+
+### "Telethon session: not connected" but the bot works
+
+This is the *expected* degraded mode when `SESSION_STRING` is bad — the bot
+itself (webhook, commands, direct forwarding) keeps running while Telethon
+retries in the background (30 s → 60 s → 120 s → every 5 min). The card on
+the dashboard and the `telethon:` line in `/health` always show the exact
+reason:
+
+| Reason on the dashboard | What it means | Fix |
+|---|---|---|
+| `SESSION_STRING is malformed` | copy/paste error, quotes, or truncated | re-copy the full string from `python login.py --string` |
+| `connection timed out after 30s` | Telegram unreachable from the host, or the string is corrupt | run `python login.py --verify`; if it fails there too, regenerate |
+| `SESSION_STRING is invalid, expired, or was revoked` | you logged in again elsewhere or terminated the session | generate a fresh string with `python login.py --string` |
+| `not configured — …` | `API_ID`/`API_HASH`/`SESSION_STRING` missing | set the listed variables in Render → Environment |
+
+Only locked-channel forwarding, protected-content fetching and topic
+discovery need the user session — everything else works without it.
 
 ### Scraping is slow
 

@@ -351,6 +351,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         telethon_status = "connected" if user_session.available else "disconnected"
     elif not cfg.has_user_session:
         telethon_status = "not configured"
+    else:
+        # Configured but the background connect loop hasn't succeeded yet —
+        # the reason (bad string, timeout, retrying) is on the web dashboard.
+        telethon_status = "connecting/retrying — check the web dashboard at the service URL"
 
     group_id = cfg.destination_group_id
     if group_id is None:
