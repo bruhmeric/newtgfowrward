@@ -51,6 +51,8 @@ os.environ.update({
     "DB_PATH": "unused-by-smoke-tests",
     "PHONE": "",
     "LOG_LEVEL": "INFO",
+    "STRIP_CAPTIONS": "",          # /strip env defaults (neutralized here)
+    "STRIP_LINKS": "",
 })
 
 print("== 1. Module imports (catches the Telethon GetForumTopicsRequest bug) ==")
@@ -376,6 +378,272 @@ check("dashboard shows polling card in polling mode",
       "polling (long-poll active)" in html_p)
 check("dashboard does not show 'not registered' webhook card in polling mode",
       "not registered" not in html_p)
+
+print("== 11. Link stripping engine (/strip links) ==")
+from telethon.tl.types import (               # noqa: E402
+    MessageEntityBold as _Bold, MessageEntityUrl as _Url,
+    MessageEntityTextUrl as _TUrl,
+)
+
+# 11a. raw URL in plain text (no entities at all)
+t, e, ch = us_mod.strip_links_from_text("check https://example.com/abc now", None)
+check("raw URL removed from plain text, spacing collapsed",
+      t == "check now" and ch, f"got {t!r}")
+
+# 11b. URL entity removed, trailing bold entity kept with shifted offset
+txt = "visit https://t.me/foo today"
+ents = [_Url(offset=6, length=16), _Bold(offset=23, length=5)]
+t, e, ch = us_mod.strip_links_from_text(txt, ents)
+check("URL entity removed; bold entity survives with shifted offset",
+      t == "visit today" and ch and e and len(e) == 1
+      and isinstance(e[0], _Bold) and e[0].offset == 6 and e[0].length == 5,
+      f"got {t!r} ents={e}")
+
+# 11c. hyperlinked text (TextUrl): visible text kept, link behind it dropped
+txt = "Join us for more"
+ents = [_TUrl(offset=0, length=4, url="https://t.me/foo")]
+t, e, ch = us_mod.strip_links_from_text(txt, ents)
+check("TextUrl: visible text kept, hyperlink entity dropped, changed=True",
+      t == txt and ch and not e, f"got {t!r} e={e}")
+
+# 11d. no links — text and entities come back untouched
+txt = "just a plain post, nothing else"
+ents = [_Bold(offset=0, length=4)]
+t, e, ch = us_mod.strip_links_from_text(txt, ents)
+check("link-free text comes back untouched",
+      t == txt and not ch and e is ents, f"got {t!r} changed={ch}")
+
+# 11e. pure-link text strips to empty
+t, e, ch = us_mod.strip_links_from_text(
+    "https://a.example/1 https://b.example/2", None)
+check("pure-link text strips to empty", t.strip() == "" and ch, f"got {t!r}")
+
+# 11f. a URL on its own line takes the whole line with it
+t, e, ch = us_mod.strip_links_from_text(
+    "line one\nhttps://t.me/spam\nline two", None)
+check("URL-only line disappears entirely",
+      t == "line one\nline two", f"got {t!r}")
+
+# 11g. intentional blank separator lines survive
+t, e, ch = us_mod.strip_links_from_text(
+    "para one\n\npara two\nhttps://x.example/y", None)
+check("intentional blank separator kept",
+      t == "para one\n\npara two", f"got {t!r}")
+
+# 11h. text_has_links
+check("text_has_links: raw URL", us_mod.text_has_links("go to t.me/foo now", None))
+check("text_has_links: URL entity",
+      us_mod.text_has_links("click", [_Url(0, 5)]))
+check("text_has_links: link-free text is False",
+      not us_mod.text_has_links("no links here", [_Bold(0, 2)]))
+check("text_has_links: empty text is False", not us_mod.text_has_links("", None))
+
+print("== 12. From-point scrape request parsing (#old / #new) ==")
+r = us_mod.parse_scrape_point_request("https://t.me/c/1234567890/42 #old")
+check("post link + #old -> private link, old, default 50",
+      r is not None and r[0].kind == "private" and r[1] == "old" and r[2] == 50,
+      f"got {r}")
+r = us_mod.parse_scrape_point_request("check this https://t.me/somechannel/99 #NEW")
+check("#NEW is case-insensitive, public link",
+      r is not None and r[0].kind == "public" and r[1] == "new" and r[2] == 50,
+      f"got {r}")
+r = us_mod.parse_scrape_point_request("https://t.me/somechannel/99 #new120")
+check("count baked into the hashtag (#new120)",
+      r is not None and r[1] == "new" and r[2] == 120, f"got {r}")
+r = us_mod.parse_scrape_point_request("https://t.me/c/1234567890/42 #old 200")
+check("count as a separate number (#old 200)",
+      r is not None and r[1] == "old" and r[2] == 200, f"got {r}")
+r = us_mod.parse_scrape_point_request("https://t.me/c/1234567890/42 #new 600")
+check("count clamped to 500",
+      r is not None and r[2] == 500, f"got {r}")
+check("no hashtag -> not a from-point request",
+      us_mod.parse_scrape_point_request(
+          "https://t.me/c/1234567890/42 forward this") is None)
+check("hashtag + channel-only link -> not a from-point request",
+      us_mod.parse_scrape_point_request(
+          "https://t.me/somechannel #new") is None)
+check("hashtag alone -> not a from-point request",
+      us_mod.parse_scrape_point_request("just talking about #new stuff") is None)
+
+print("== 13. From-point delivery ordering ==")
+
+
+class _FakeMsg:
+    def __init__(self, id_, gid=None):
+        self.id = id_
+        self.grouped_id = gid
+        self.message = None
+        self.media = None
+        self.entities = None
+
+
+out = us_mod.order_messages_for_delivery(
+    [_FakeMsg(50), _FakeMsg(49), _FakeMsg(48), _FakeMsg(47)], "old")
+check("'old' fetch (newest->oldest) reversed into chronological order",
+      [m.id for m in out] == [47, 48, 49, 50],
+      f"got {[m.id for m in out]}")
+out = us_mod.order_messages_for_delivery(
+    [_FakeMsg(47), _FakeMsg(48), _FakeMsg(49), _FakeMsg(50)], "new")
+check("'new' fetch (already chronological) passed through",
+      [m.id for m in out] == [47, 48, 49, 50])
+out = us_mod.order_messages_for_delivery(
+    [_FakeMsg(47), _FakeMsg(50, gid=9), _FakeMsg(48, gid=9),
+     _FakeMsg(49, gid=9)], "new")
+check("album run re-sorted ascending by id",
+      [m.id for m in out] == [47, 48, 49, 50],
+      f"got {[m.id for m in out]}")
+
+print("== 14. /strip env defaults in Config ==")
+os.environ["STRIP_CAPTIONS"] = "true"
+os.environ["STRIP_LINKS"] = "1"
+cfg_strip = config_mod.Config.load()
+check("STRIP_CAPTIONS=true / STRIP_LINKS=1 parsed",
+      cfg_strip.strip_captions is True and cfg_strip.strip_links is True)
+os.environ["STRIP_CAPTIONS"] = ""
+os.environ["STRIP_LINKS"] = ""
+cfg_strip2 = config_mod.Config.load()
+check("strip defaults are off when env unset",
+      cfg_strip2.strip_captions is False and cfg_strip2.strip_links is False)
+
+print("== 15. send_to_destination strip paths (fake Telethon client) ==")
+
+
+async def strip_send_tests() -> None:
+    class FakeClient:
+        def __init__(self):
+            self.forwards = []
+            self.sends = []
+
+        async def forward_messages(self, dest, ids, src):
+            self.forwards.append((dest, list(ids), src))
+            return True
+
+        async def send_message(self, dest, **kwargs):
+            self.sends.append(kwargs)
+            return True
+
+    class FakeEnt:
+        def __init__(self, id_):
+            self.id = id_
+
+    class FakeMsg:
+        def __init__(self, id_, text, media=None, entities=None):
+            self.id = id_
+            self.message = text
+            self.media = media
+            self.entities = entities
+            self.grouped_id = None
+            self.action = None
+
+    us = us_mod.UserSession(
+        "t", 12345, "abcdef",
+        session_string=_make_session_string(2, "149.154.167.51"))
+    src, dst = FakeEnt(-100123), FakeEnt(-100999)
+
+    async def fake_resolve(ref):
+        return src if ref == -100123 else dst
+
+    us._get_entity_with_warmup = fake_resolve   # shadow the method (no network)
+
+    # A. no strip settings -> true-forward fast path
+    fc = FakeClient()
+    us.client = fc
+    ok, _diag = await us.send_to_destination(
+        source_chat_id=-100123, source_message_ids=[5], dest_chat_id=-100999,
+        pre_messages=[FakeMsg(5, "plain caption", media=object())],
+        source_entity=src, dest_entity=dst)
+    check("no strip settings -> true forward used",
+          ok and len(fc.forwards) == 1 and not fc.sends,
+          f"forwards={len(fc.forwards)} sends={len(fc.sends)}")
+
+    # B. strip_captions -> re-sent with an empty caption
+    fc = FakeClient()
+    us.client = fc
+    ok, _diag = await us.send_to_destination(
+        source_chat_id=-100123, source_message_ids=[5], dest_chat_id=-100999,
+        pre_messages=[FakeMsg(5, "ad caption", media=object())],
+        source_entity=src, dest_entity=dst, strip_captions=True)
+    check("strip_captions -> re-sent without caption",
+          ok and not fc.forwards and len(fc.sends) == 1
+          and fc.sends[0]["message"] == "",
+          f"forwards={len(fc.forwards)} sends={fc.sends and fc.sends[0]}")
+
+    # C. strip_links -> caption re-sent without the URL
+    fc = FakeClient()
+    us.client = fc
+    ok, _diag = await us.send_to_destination(
+        source_chat_id=-100123, source_message_ids=[5], dest_chat_id=-100999,
+        pre_messages=[FakeMsg(5, "watch this https://ads.example/x now",
+                              media=object())],
+        source_entity=src, dest_entity=dst, strip_links=True)
+    check("strip_links -> caption re-sent without URL",
+          ok and not fc.forwards and len(fc.sends) == 1
+          and fc.sends[0]["message"] == "watch this now",
+          f"sends={fc.sends and fc.sends[0]['message']!r}")
+
+    # D. a text post that is ONLY links -> skipped entirely
+    fc = FakeClient()
+    us.client = fc
+    ok, diag = await us.send_to_destination(
+        source_chat_id=-100123, source_message_ids=[5], dest_chat_id=-100999,
+        pre_messages=[FakeMsg(5, "https://a.example/1 https://b.example/2")],
+        source_entity=src, dest_entity=dst, strip_links=True)
+    check("pure-link text post skipped under strip_links",
+          ok and not fc.forwards and not fc.sends
+          and any("Nothing to send" in d for d in diag),
+          f"ok={ok} forwards={len(fc.forwards)} sends={len(fc.sends)}")
+
+    # E. empty-caption media under strip_captions -> nothing changes, so the
+    #    fast true-forward path is still used
+    fc = FakeClient()
+    us.client = fc
+    ok, _diag = await us.send_to_destination(
+        source_chat_id=-100123, source_message_ids=[5], dest_chat_id=-100999,
+        pre_messages=[FakeMsg(5, "", media=object())],
+        source_entity=src, dest_entity=dst, strip_captions=True)
+    check("empty caption + strip_captions -> true forward (nothing to change)",
+          ok and len(fc.forwards) == 1 and not fc.sends,
+          f"forwards={len(fc.forwards)} sends={len(fc.sends)}")
+
+    # F. custom_caption keeps winning over the strip toggles
+    fc = FakeClient()
+    us.client = fc
+    ok, _diag = await us.send_to_destination(
+        source_chat_id=-100123, source_message_ids=[5], dest_chat_id=-100999,
+        pre_messages=[FakeMsg(5, "original", media=object())],
+        source_entity=src, dest_entity=dst,
+        custom_caption="MY TEXT", strip_captions=True, strip_links=True)
+    check("custom caption wins over strip settings",
+          ok and not fc.forwards and len(fc.sends) == 1
+          and fc.sends[0]["message"] == "MY TEXT")
+
+
+asyncio.run(strip_send_tests())
+
+print("== 16. Dashboard + /health surface the new features ==")
+_state_on = {
+    "ready": True, "bot_username": "testbot", "attempts": 1,
+    "webhook_registered": False, "user_session": "connected as @x (1)",
+    "phase": "running", "error": None, "hint": None,
+    "wh_info": None, "wh_info_ts": 0.0,
+    "strip": {"captions": True, "links": False},
+    "scrape": "running — somechannel #500 new (sent 12)",
+}
+html_on = bot_mod._render_dashboard(pcfg, _state_on)
+check("dashboard shows forward-cleaning card when stripping is on",
+      "Forward cleaning" in html_on and "stripping captions" in html_on)
+check("dashboard shows live scrape state",
+      "somechannel #500" in html_on and "running" in html_on)
+_state_off = dict(_state_on)
+_state_off["strip"] = {"captions": False, "links": False}
+_state_off["scrape"] = None
+html_off = bot_mod._render_dashboard(pcfg, _state_off)
+check("dashboard shows idle scrape + strip-off states",
+      "idle" in html_off and "originals kept" in html_off)
+lines = bot_mod._health_runtime_lines(_state_on)
+check("health endpoint lines carry strip + scrape state",
+      "strip_captions: on" in lines and "strip_links: off" in lines
+      and "scrape: running" in lines, f"got {lines!r}")
 
 print()
 print(f"RESULT: {PASS} passed, {FAIL} failed")

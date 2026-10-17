@@ -21,7 +21,10 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes, MessageHandler, filters
 
-from user_session import parse_telegram_link, parse_channel_link, UserSession
+from user_session import (
+    parse_telegram_link, parse_channel_link, parse_scrape_point_request,
+    UserSession,
+)
 from db import Database
 
 logger = logging.getLogger(__name__)
@@ -65,6 +68,21 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     text = update.effective_message.text or update.effective_message.caption or ""
+
+    # ---- from-point scrape shortcut ----
+    # A post link with #old / #new appended (e.g.
+    # "https://t.me/c/1234567890/42 #new" or "… #old 200") means "scrape
+    # from this post", not "forward this one post". The hashtag makes the
+    # intent explicit so a link in normal conversation still gets the
+    # regular topic picker.
+    point_req = parse_scrape_point_request(text)
+    if point_req:
+        parsed_point, direction, count = point_req
+        from handlers.admin import run_scrape_from_point
+        await run_scrape_from_point(
+            update, context, parsed_point, direction, count)
+        return
+
     user_session: UserSession = context.bot_data.get("user_session")
     if not user_session or not user_session.available:
         await update.effective_message.reply_text(

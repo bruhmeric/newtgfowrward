@@ -113,11 +113,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/test_link <url>  — diagnostic: test fetching a t.me link\n"
         "/saved <url>    — 🚀 FAST: send t.me link content to Saved Messages\n"
         "/scrape <url> [flags]  — 🤖 AUTO: scrape ALL media from a channel\n"
+        "/scrape <post_link> old|new [N]  — 🎯 scrape from that post,\n"
+        "     back in history (old) or toward the newest posts (new), N msgs\n"
         "/stop_scrape    — 🛑 stop the active scrape\n"
         "/scrape_status  — 📊 check scrape progress\n"
         "/caption <text>  — 📝 set a custom caption (replaces original)\n"
         "/caption strip   — 📝 strip ALL captions from forwarded media\n"
         "/caption clear   — 📝 restore original captions\n"
+        "/strip          — 🧹 toggle stripping captions/links on forward\n"
         "/cancel         — cancel the latest pending forward\n"
         "\n*Sending content*\n"
         "• Send me a photo / video / text / file -> I show topics (if forum) "
@@ -128,17 +131,22 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "(fastest path)\n"
         "• `/scrape <url>` -> scrape the entire channel and auto-send all "
         "media to your destination\n"
+        "• Send a post link with `#old` / `#new` appended (e.g. "
+        "`https://t.me/c/1234567890/42 #new`) -> scrape from that post "
+        "backward or forward — same as `/scrape <link> old|new`\n"
         "\n*Scrape flags*\n"
-        "  `old` — oldest first (chronological)\n"
+        "  `old` / `new` — direction FROM a post link (includes that post)\n"
+        "  `<count>` / `count=N` — max messages from the point (default 50)\n"
         "  `saved` — send to Saved Messages (default: destination group)\n"
         "  `photo` / `video` / `doc` / `audio` / `voice` / `animation` — filter by media type\n"
         "  `parallel=N` — set parallel sends (default 3, max 10)\n"
-        "  Example: `/scrape https://t.me/c/123 saved old videos parallel=5`\n"
-        "\n*Captions*\n"
-        "  `/caption <text>` — set a custom caption applied to all forwards\n"
-        "  `/caption strip` — strip ALL captions (forward media without any text)\n"
-        "  `/caption clear` — restore original caption behavior\n"
-        "  `/caption` (no args) — show current setting\n"
+        "  Example: `/scrape https://t.me/c/123/456 new 100 videos parallel=5`\n"
+        "\n*Captions & links (/strip)*\n"
+        "  `/strip captions on|off` — forward media WITHOUT its caption\n"
+        "  `/strip links on|off` — remove URLs/hyperlinks from forwarded text\n"
+        "  `/strip on` / `/strip off` — both at once\n"
+        "  Applies to link forwards, /saved and all scraping. A post that is "
+        "just a link is skipped entirely when link stripping is on.\n"
         "\n*Destination types*\n"
         "• Forum groups: pick a topic from the picker\n"
         "• Regular groups/channels: single Forward button (no topic picker)\n"
@@ -381,6 +389,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     scrape_state = (
         "running" if scrape_task and not scrape_task.done() else "idle"
     )
+    strip_c, strip_l = await _get_strip_settings(context)
 
     msg = (
         f"Bot status:\n"
@@ -393,7 +402,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"• Admin whitelist: {len(cfg.admin_ids)} user(s)\n"
         f"• Keep-alive: {'on' if cfg.keep_alive else 'off'}"
         f" (every {cfg.keep_alive_interval}s)\n"
-        f"• Scrape: {scrape_state}"
+        f"• Scrape: {scrape_state}\n"
+        f"• Strip captions: {'ON' if strip_c else 'off'}\n"
+        f"• Strip links: {'ON' if strip_l else 'off'}"
     )
     await update.effective_message.reply_text(msg)
 
@@ -665,6 +676,7 @@ async def cmd_saved(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # This is a direct call to send_to_destination with dest_chat_id="me"
         # which Telethon resolves to the user's own Saved Messages chat.
         custom_caption = await _get_custom_caption(context)
+        strip_captions, strip_links = await _get_strip_settings(context)
         success, diag = await user_session.send_to_destination(
             source_chat_id=int(parsed.chat_ref) if parsed.kind == "private" else parsed.chat_ref,
             source_message_ids=[parsed.message_id],
@@ -672,6 +684,8 @@ async def cmd_saved(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             topic_id=None,
             progress_callback=progress_cb,
             custom_caption=custom_caption,
+            strip_captions=strip_captions,
+            strip_links=strip_links,
         )
     except Exception as e:
         logger.exception("/saved failed")
@@ -750,25 +764,25 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if not context.args:
         await update.effective_message.reply_text(
-            "Usage: `/scrape <channel_url> [flags]`\n\n"
+            "Usage: `/scrape <url> [flags]`\n\n"
+            "🎯 From a specific post (add old / new):\n"
+            "  `/scrape https://t.me/c/1234567890/42 new` — from post #42 → newer\n"
+            "  `/scrape https://t.me/c/1234567890/42 old 100` — post #42 + 99 older\n"
+            "  (you can also just send the link with #old / #new appended)\n\n"
+            "Whole channel:\n"
+            "  `/scrape https://t.me/publicchannel`\n\n"
             "Flags:\n"
-            "  `old` — oldest first (chronological)\n"
+            "  `old` / `new` — from-point direction (needs a POST link)\n"
+            "  `<count>` or `count=N` — max messages from that point (default 50, max 500)\n"
             "  `saved` — send to Saved Messages (default: destination group)\n"
-            "  `photo` / `photos` — only photos\n"
-            "  `video` / `videos` — only videos\n"
-            "  `doc` / `docs` — only documents\n"
-            "  `audio` — only audio\n"
-            "  `voice` — only voice messages\n"
-            "  `animation` — only animations (GIFs)\n"
-            "  `parallel=N` — set parallel sends (default 3, max 10)\n"
-            "  `min=N` — resume: skip messages with id <= N\n"
-            "  `max=N` — resume: stop after messages with id > N\n\n"
-            "Examples:\n"
-            "  `/scrape https://t.me/publicchannel`\n"
-            "  `/scrape https://t.me/c/1234567890 saved old`\n"
-            "  `/scrape https://t.me/c/1234567890 photo video`\n"
-            "  `/scrape https://t.me/c/123 saved old videos parallel=5`\n"
-            "  `/scrape https://t.me/c/123 min=1042` — resume an interrupted run",
+            "  `photo` / `video` / `doc` / `audio` / `voice` / `animation` — media filter\n"
+            "  `parallel=N` — parallel sends (default 3, max 10)\n"
+            "  `min=N` / `max=N` — resume bounds for whole-channel runs\n\n"
+            "Notes:\n"
+            "  • From-point runs forward EVERYTHING (text posts included)\n"
+            "    unless a media filter is given\n"
+            "  • The linked post itself is included\n"
+            "  • Messages arrive in chronological order",
             parse_mode="Markdown",
         )
         return
@@ -812,6 +826,41 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # If no media types specified, set to None (all media)
     if not media_types:
         media_types = None
+
+    # ---- from-point mode: POST link + direction flag (old/new) ----
+    # /scrape https://t.me/c/123/456 new 100   → scrape from post #456
+    # forward; a post link + `old` walks back instead. Without a direction
+    # flag a post link still means "whole channel" (legacy behavior).
+    from user_session import parse_telegram_link as _parse_post_link
+    parsed_post = _parse_post_link(url)
+    direction = None
+    if "new" in raw_flags or "newer" in raw_flags:
+        direction = "new"
+    elif "old" in raw_flags or "older" in raw_flags or "back" in raw_flags:
+        direction = "old"
+    point_count = None
+    for flag in raw_flags:
+        if flag.startswith("count="):
+            try:
+                point_count = int(flag.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif flag.isdigit() and parsed_post is not None and direction:
+            point_count = int(flag)
+    if parsed_post and direction:
+        await run_scrape_from_point(
+            update, context, parsed_post, direction, point_count or 50,
+            media_types=media_types, parallel=parallel,
+            send_to_saved=send_to_saved)
+        return
+    if parsed_post and point_count is not None and not direction:
+        await update.effective_message.reply_text(
+            "A count alone isn't enough — add a direction:\n"
+            "  `/scrape <post_link> old <count>` — back in history\n"
+            "  `/scrape <post_link> new <count>` — toward the newest posts",
+            parse_mode="Markdown",
+        )
+        return
 
     # Try parsing as a channel-only link first, then fall back to a post link
     parsed = parse_channel_link(url)
@@ -979,6 +1028,316 @@ async def _get_custom_caption(context) -> str | None:
     if raw is None or raw == "__none__":
         return None  # use original
     return raw  # "" means strip, anything else is custom text
+
+
+async def _get_strip_settings(context) -> tuple[bool, bool]:
+    """Load the /strip settings: (strip_captions, strip_links).
+
+    Precedence: in-memory cache (set by /strip) > DB runtime_config (set by
+    /strip on a previous boot) > env defaults (STRIP_CAPTIONS/STRIP_LINKS).
+    """
+    cached = context.bot_data.get("strip_settings")
+    if cached is not None:
+        return bool(cached.get("captions")), bool(cached.get("links"))
+    db = context.bot_data["db"]
+    cfg = context.bot_data["config"]
+    cap = await db.get_runtime("strip_captions")
+    lnk = await db.get_runtime("strip_links")
+    captions = (cap == "1") if cap is not None else bool(
+        getattr(cfg, "strip_captions", False))
+    links = (lnk == "1") if lnk is not None else bool(
+        getattr(cfg, "strip_links", False))
+    return captions, links
+
+
+def _sync_strip_state(captions: bool, links: bool) -> None:
+    """Mirror the /strip settings into bot.py's dashboard state (lazy import —
+    bot.py imports this module at load time, so a top-level import here would
+    be circular)."""
+    try:
+        import bot as _bot
+        _bot._STATE["strip"] = {"captions": bool(captions), "links": bool(links)}
+    except Exception:
+        logger.debug("could not sync strip state to dashboard", exc_info=True)
+
+
+async def cmd_strip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle caption/link stripping for ALL forwards.
+
+    Usage:
+      /strip               — show current settings
+      /strip on|off        — both toggles at once
+      /strip captions on|off  — media posts forwarded WITHOUT their caption
+      /strip links on|off     — URLs (and hyperlinks) removed from any
+                                forwarded text/caption
+
+    Applies to every sourced forward: post links, /saved, /scrape, and
+    from-point scraping (#old / #new). Text-only posts keep their text —
+    only links are removed from them (a post that is JUST a link is
+    skipped entirely). A custom caption set with /caption still wins over
+    the captions toggle until you /caption clear.
+    """
+    cfg = context.bot_data["config"]
+    db = context.bot_data["db"]
+    if not cfg.is_admin(update.effective_user.id):
+        logger.warning("/strip DENIED — user_id=%s not in ADMIN_IDS=%s",
+                       update.effective_user.id, cfg.admin_ids)
+        return
+
+    cur_cap, cur_lnk = await _get_strip_settings(context)
+    args = [a.lower() for a in (context.args or [])]
+
+    def _fmt(on: bool) -> str:
+        return "✅ ON" if on else "⚪ off"
+
+    if not args:
+        cap_note = ""
+        custom = await _get_custom_caption(context)
+        if custom not in (None, ""):
+            cap_note = ("\n⚠️ A custom caption is set (/caption) — it "
+                        "overrides the captions toggle until you "
+                        "`/caption clear`.")
+        await update.effective_message.reply_text(
+            f"🧹 Forward cleaning:\n\n"
+            f"• Captions: {_fmt(cur_cap)} — media posts forwarded "
+            f"{'WITHOUT' if cur_cap else 'with'} their caption\n"
+            f"• Links: {_fmt(cur_lnk)} — links are "
+            f"{'removed from' if cur_lnk else 'kept in'} forwarded text"
+            f"{cap_note}\n\n"
+            f"Usage:\n"
+            f"  `/strip on` / `/strip off` — both at once\n"
+            f"  `/strip captions on|off`\n"
+            f"  `/strip links on|off`",
+            parse_mode="Markdown",
+        )
+        return
+
+    def _parse_on_off(token: str | None) -> bool | None:
+        if token in ("on", "true", "1", "yes"):
+            return True
+        if token in ("off", "false", "0", "no"):
+            return False
+        return None
+
+    new_cap: bool | None = None
+    new_lnk: bool | None = None
+    a0 = args[0]
+    if a0 in ("on", "off", "all", "none"):
+        val = a0 not in ("off", "none")
+        new_cap, new_lnk = val, val
+    elif a0 in ("captions", "caption", "cap"):
+        val = _parse_on_off(args[1] if len(args) > 1 else None)
+        if val is None:
+            await update.effective_message.reply_text(
+                "Usage: `/strip captions on|off`", parse_mode="Markdown")
+            return
+        new_cap = val
+    elif a0 in ("links", "link"):
+        val = _parse_on_off(args[1] if len(args) > 1 else None)
+        if val is None:
+            await update.effective_message.reply_text(
+                "Usage: `/strip links on|off`", parse_mode="Markdown")
+            return
+        new_lnk = val
+    else:
+        await update.effective_message.reply_text(
+            "Unknown option. Use `/strip on|off`, `/strip captions on|off` "
+            "or `/strip links on|off` (or plain `/strip` to see status).",
+            parse_mode="Markdown",
+        )
+        return
+
+    if new_cap is not None:
+        await db.set_runtime("strip_captions", "1" if new_cap else "0")
+    if new_lnk is not None:
+        await db.set_runtime("strip_links", "1" if new_lnk else "0")
+    final_cap = new_cap if new_cap is not None else cur_cap
+    final_lnk = new_lnk if new_lnk is not None else cur_lnk
+    context.bot_data["strip_settings"] = {
+        "captions": final_cap, "links": final_lnk}
+    _sync_strip_state(final_cap, final_lnk)
+
+    changed = []
+    if new_cap is not None:
+        changed.append(f"captions {'ON — media forwards will have no caption' if new_cap else 'OFF — original captions kept'}")
+    if new_lnk is not None:
+        changed.append(f"links {'ON — links removed from forwarded text' if new_lnk else 'OFF — links kept'}")
+    await update.effective_message.reply_text(
+        f"✅ Updated: " + "; ".join(changed) +
+        f"\n\nNow: captions {_fmt(final_cap)}, links {_fmt(final_lnk)}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# From-point scraping (post link + old/new direction)
+# ---------------------------------------------------------------------------
+
+async def run_scrape_from_point(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    parsed,                    # ParsedLink (kind/chat_ref/message_id)
+    direction: str,            # 'old' | 'new'
+    count: int = 50,
+    media_types: list[str] | None = None,
+    parallel: int = 3,
+    send_to_saved: bool = False,
+) -> None:
+    """Start a from-point scrape as a background task. Shared by:
+      * /scrape <post_link> old|new [count] [flags]
+      * a bare message with a post link + #old / #new hashtag
+
+    Performs the admin/session/destination checks and wires the status
+    callbacks + bot_data state that /stop_scrape and /scrape_status read.
+    """
+    import asyncio
+    cfg = context.bot_data["config"]
+    if not cfg.is_admin(update.effective_user.id):
+        logger.warning("from-point scrape DENIED — user_id=%s not in ADMIN_IDS",
+                       update.effective_user.id)
+        return
+    user_session = context.bot_data.get("user_session")
+    if not user_session or not user_session.available:
+        await update.effective_message.reply_text(
+            "❌ Telethon user session not available.\n"
+            "Run `python login.py --string` locally and set SESSION_STRING env var."
+        )
+        return
+
+    if context.bot_data.get("scrape_task") and not context.bot_data["scrape_task"].done():
+        await update.effective_message.reply_text(
+            "⚠️ A scrape is already running. Use /stop_scrape to stop it first, "
+            "or /scrape_status to check progress."
+        )
+        return
+
+    count = max(1, min(int(count or 50), 500))
+    parallel = max(1, min(int(parallel or 3), 10))
+
+    # Destination: Saved Messages or the configured group
+    if send_to_saved:
+        dest_chat_id = "me"
+        dest_label = "Saved Messages"
+    else:
+        db = context.bot_data["db"]
+        dest_chat_id = cfg.destination_group_id
+        if dest_chat_id is None:
+            v = await db.get_runtime("destination_group_id")
+            dest_chat_id = int(v) if v else None
+        if dest_chat_id is None:
+            await update.effective_message.reply_text(
+                "No destination group set. Either:\n"
+                "  • /setgroup <group_id> first, OR\n"
+                "  • add the `saved` flag to send to Saved Messages"
+            )
+            return
+        dest_label = f"chat {dest_chat_id}"
+
+    arrow = "⬅ back in history" if direction == "old" else "➡ toward the newest posts"
+    filter_desc = "everything (incl. text posts)" if not media_types \
+        else "only: " + ", ".join(media_types)
+    status_msg = await update.effective_message.reply_text(
+        f"🎯 From-point scrape starting…\n\n"
+        f"Source: `{parsed.chat_ref}` (post #{parsed.message_id})\n"
+        f"Direction: {direction} ({arrow})\n"
+        f"Count: up to {count} message(s)\n"
+        f"Destination: {dest_label}\n"
+        f"Filter: {filter_desc}\n\n"
+        f"_Use /stop_scrape to cancel._",
+        parse_mode="Markdown",
+    )
+
+    cancel_event = asyncio.Event()
+    context.bot_data["scrape_cancel"] = cancel_event
+    context.bot_data["scrape_status"] = {
+        "sent_count": 0, "failed_count": 0, "skipped_count": 0,
+        "total_seen": 0, "last_message_id": 0,
+        "started_at": time.time(),
+        "source_ref": parsed.chat_ref,
+        "dest_label": dest_label,
+        "order": f"from #{parsed.message_id} {'old' if direction == 'old' else 'new'}",
+        "filter": filter_desc,
+        "parallel": parallel,
+        "anchor_id": parsed.message_id,
+        "direction": direction,
+    }
+    try:
+        import bot as _bot
+        _bot._STATE["scrape"] = (
+            f"running — {parsed.chat_ref} #{parsed.message_id} "
+            f"{direction} (sent 0)")
+    except Exception:
+        pass
+
+    last_status_text = {"value": ""}
+
+    async def status_callback(text: str):
+        if text == last_status_text["value"]:
+            return
+        last_status_text["value"] = text
+        context.bot_data["scrape_status"].update({"last_update": time.time()})
+        try:
+            await status_msg.edit_text(text)
+        except Exception:
+            pass  # rate-limited or unchanged
+
+    async def stats_callback(result_dict: dict):
+        context.bot_data["scrape_status"].update({
+            "sent_count": result_dict.get("sent_count", 0),
+            "failed_count": result_dict.get("failed_count", 0),
+            "skipped_count": result_dict.get("skipped_count", 0),
+            "total_seen": result_dict.get("total_seen", 0),
+            "last_message_id": result_dict.get("last_message_id", 0),
+            "flood_waits": result_dict.get("flood_waits", 0),
+            "cancelled": result_dict.get("cancelled", False),
+            "last_update": time.time(),
+        })
+        try:
+            import bot as _bot
+            _bot._STATE["scrape"] = (
+                f"running — {parsed.chat_ref} #{parsed.message_id} "
+                f"{direction} (sent {result_dict.get('sent_count', 0)})")
+        except Exception:
+            pass
+
+    async def scrape_task():
+        try:
+            custom_caption = await _get_custom_caption(context)
+            strip_captions, strip_links = await _get_strip_settings(context)
+            await user_session.scrape_from_point(
+                source_chat_ref=int(parsed.chat_ref) if parsed.kind == "private"
+                                else parsed.chat_ref,
+                anchor_message_id=parsed.message_id,
+                direction=direction,
+                dest_chat_id=dest_chat_id,
+                count=count,
+                topic_id=None,
+                cancel_event=cancel_event,
+                status_callback=status_callback,
+                stats_callback=stats_callback,
+                media_types=media_types,
+                parallel=parallel,
+                custom_caption=custom_caption,
+                strip_captions=strip_captions,
+                strip_links=strip_links,
+            )
+        except Exception as e:
+            logger.exception("from-point scrape task failed")
+            try:
+                await status_msg.edit_text(f"❌ Scrape crashed: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+        finally:
+            context.bot_data.pop("scrape_task", None)
+            context.bot_data.pop("scrape_cancel", None)
+            try:
+                import bot as _bot
+                _bot._STATE["scrape"] = "idle"
+            except Exception:
+                pass
+
+    context.bot_data["scrape_task"] = asyncio.create_task(scrape_task())
+    logger.info("From-point scrape started: %s #%d %s count=%d -> %s",
+                parsed.chat_ref, parsed.message_id, direction, count, dest_label)
 
 
 async def cmd_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1153,4 +1512,5 @@ def register_admin_handlers(app) -> None:
     app.add_handler(CommandHandler("stop_scrape", cmd_stop_scrape))
     app.add_handler(CommandHandler("scrape_status", cmd_scrape_status))
     app.add_handler(CommandHandler("caption", cmd_caption))
+    app.add_handler(CommandHandler("strip", cmd_strip))
     app.add_handler(CommandHandler("cancel", cmd_cancel))

@@ -3,8 +3,82 @@
 This release fixes several real bugs, hardens the webhook server, and tunes
 the bot specifically for Render's free tier (512 MB RAM / 0.1 CPU / 15-min
 sleep / ephemeral disk). All changes are covered by `smoke_test.py`
-(61 checks) and `webhook_e2e_test.py` (28 checks) — run both locally with
+(95 checks) and `webhook_e2e_test.py` (28 checks) — run both locally with
 `pip install -r requirements.txt` first.
+
+---
+
+## Feature release: from-point scraping + /strip (captions & links)
+
+### 1. Scrape a channel FROM a specific post (old / new)
+
+Send a post link with a direction and the bot scrapes from exactly that
+point, instead of the whole channel:
+
+```
+/scrape https://t.me/c/1234567890/42 new        ← post #42 + the 49 newer posts
+/scrape https://t.me/c/1234567890/42 old 100    ← post #42 + the 99 older posts
+https://t.me/c/1234567890/42 #new               ← same thing, no command needed
+https://t.me/somechannel/500 #old 200           ← bare message with count
+```
+
+- **Direction `old`** walks back in history from the linked post,
+  **`new`** walks toward the newest posts. The linked post itself is
+  included in both directions.
+- Messages are delivered in **chronological order** so the destination
+  reads like the source (the `old` fetch is reversed; album items are
+  re-sorted by id so albums don't come out flipped).
+- Count defaults to 50, clamped to 500 per run; give it as a bare number
+  (`old 100`), `count=100`, or baked into the hashtag (`#old100`).
+- Unlike whole-channel `/scrape` (media-only), from-point runs forward
+  **everything — text posts included** — unless you add a media filter
+  (`photo video doc …`).
+- The `#old` / `#new` hashtag form works in a plain message (the admin
+  forwards a post from the source channel and appends the hashtag); the
+  hashtag is what makes the intent explicit, so a bare link in
+  conversation still gets the normal one-post topic picker.
+- Reuses the same engine as whole-channel scraping: album batching,
+  3-tier protected-content fallback, FloodWait retry, parallel sends,
+  `/stop_scrape` + `/scrape_status`, and the /strip settings.
+
+### 2. `/strip` — strip captions and/or links on forward
+
+```
+/strip                  ← show current settings
+/strip on / off         ← both toggles at once
+/strip captions on|off  ← media posts forwarded WITHOUT their caption
+/strip links on|off     ← URLs & hyperlinks removed from forwarded text
+```
+
+- Applies to **every sourced forward**: post links (topic picker), `/saved`,
+  whole-channel `/scrape`, and from-point scraping. Content you upload
+  directly to the bot is untouched.
+- Link stripping handles all three forms: raw URLs (with or without
+  entities), URL entities, and "click [here]" hyperlinks (visible text
+  kept, link dropped). Bold/italic/hashtag entities survive with their
+  offsets shifted (UTF-16 math via Telethon's surrogate helpers).
+- Text cleanup after removal: doubled spaces collapse, a line that only
+  held a link disappears, runs of blank lines collapse to one.
+- Text-only posts keep their text (only links are removed); a post that
+  is *just* links is skipped entirely.
+- Smart fast path: when nothing would change (no links present, caption
+  already empty), the true-forward path is still used — no re-upload cost.
+- Persisted in the DB (`strip_captions` / `strip_links` runtime keys);
+  `STRIP_CAPTIONS` / `STRIP_LINKS` env vars provide the boot defaults.
+  A `/caption <text>` custom caption still wins over the captions toggle.
+- Visible on the web dashboard ("Forward cleaning" card), in `/status`,
+  and in `/health` (`strip_captions:` / `strip_links:` lines), alongside a
+  new live **Scrape** card (`scrape:` in /health).
+
+### Tests
+
+- `smoke_test.py` **95/95** — new sections 11–16: the link-strip engine
+  (raw URLs, entity shifting, TextUrl, pure-link, line cleanup),
+  `#old/#new` request parsing, delivery ordering, env defaults, fake-client
+  integration of every `send_to_destination` strip path (fast-path choice,
+  re-send with empty/stripped caption, skip pure-link posts, custom-caption
+  precedence), dashboard/health rendering.
+- `webhook_e2e_test.py` **28/28** (unchanged).
 
 ---
 

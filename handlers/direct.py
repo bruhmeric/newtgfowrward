@@ -770,9 +770,10 @@ async def _forward_link(context, payload, dest_group_id, topic_id,
         source_chat_id = payload["source_chat_id"]
         source_message_ids = payload["source_message_ids"]
         # Load the custom_caption setting (None = use original, "" = strip,
-        # "<text>" = use this text)
-        from handlers.admin import _get_custom_caption
+        # "<text>" = use this text) and the /strip toggles
+        from handlers.admin import _get_custom_caption, _get_strip_settings
         custom_caption = await _get_custom_caption(context)
+        strip_captions, strip_links = await _get_strip_settings(context)
         success, diag = await user_session.send_to_destination(
             source_chat_id=source_chat_id,
             source_message_ids=source_message_ids,
@@ -780,6 +781,8 @@ async def _forward_link(context, payload, dest_group_id, topic_id,
             topic_id=topic_id,
             progress_callback=progress_callback,
             custom_caption=custom_caption,
+            strip_captions=strip_captions,
+            strip_links=strip_links,
         )
         if not success:
             # Build a helpful error message — show the last few diagnostic lines

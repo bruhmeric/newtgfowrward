@@ -121,6 +121,10 @@ _STATE: dict[str, Any] = {
     "user_session": "starting…",
     "wh_info": None,    # cached Telegram get_webhook_info payload
     "wh_info_ts": 0.0,
+    # /strip settings + scrape activity — seeded by post_init, updated by
+    # the /strip command and the scrape runners (see _sync_strip_state).
+    "strip": {"captions": False, "links": False},
+    "scrape": None,     # None/"idle" or "running — <source> #<id> <dir> (sent N)"
 }
 
 # Owns the Telethon user-session background lifecycle. The user session is
@@ -143,6 +147,17 @@ def _scrub(cfg: Config, text: Any) -> str:
         if s:
             out = out.replace(s, "***")
     return out
+
+
+def _health_runtime_lines(state: dict) -> str:
+    """Feature-state lines shared by the webhook and polling /health
+    handlers: the /strip toggles and scrape activity."""
+    strip = state.get("strip") or {}
+    return (
+        f"strip_captions: {'on' if strip.get('captions') else 'off'}\n"
+        f"strip_links: {'on' if strip.get('links') else 'off'}\n"
+        f"scrape: {state.get('scrape') or 'idle'}\n"
+    )
 
 
 def _startup_hint(exc: BaseException) -> str:
@@ -279,6 +294,25 @@ def _render_dashboard(cfg: Config, state: dict) -> str:
         "Destination group",
         esc(str(cfg.destination_group_id)) if cfg.destination_group_id
         else "<span class='dim'>not set — use /setgroup</span>"))
+
+    # Forward cleaning (/strip) — ON states are worth an at-a-glance look
+    # because they silently change every forward the bot makes.
+    strip = state.get("strip") or {}
+    on_bits = [lbl for lbl, key in (("captions", "captions"), ("links", "links"))
+               if strip.get(key)]
+    if on_bits:
+        cards.append(card("Forward cleaning",
+                          f'<span class="warn">stripping {esc(", ".join(on_bits))}</span>'))
+    else:
+        cards.append(card("Forward cleaning",
+                          '<span class="dim">off — originals kept</span>'))
+
+    # Scrape activity (whole-channel or from-point)
+    scrape_state = str(state.get("scrape") or "idle")
+    if scrape_state.startswith("running"):
+        cards.append(card("Scrape", f'<span class="ok">{esc(scrape_state)}</span>'))
+    else:
+        cards.append(card("Scrape", '<span class="dim">idle</span>'))
 
     wh = state.get("wh_info") or {}
     if ready and wh:
@@ -475,6 +509,22 @@ async def post_init(app: Application) -> None:
             logger.info("Destination group restored from DB: %d", cfg.destination_group_id)
         except ValueError:
             pass
+
+    # /strip settings: DB value (set by /strip on a previous boot) wins over
+    # the env defaults (STRIP_CAPTIONS / STRIP_LINKS). Cached on bot_data for
+    # the handlers and mirrored into _STATE for the dashboard + /health.
+    try:
+        _cap_raw = await db.get_runtime("strip_captions")
+        _lnk_raw = await db.get_runtime("strip_links")
+        strip_caps = (_cap_raw == "1") if _cap_raw is not None else bool(
+            getattr(cfg, "strip_captions", False))
+        strip_lnks = (_lnk_raw == "1") if _lnk_raw is not None else bool(
+            getattr(cfg, "strip_links", False))
+        app.bot_data["strip_settings"] = {
+            "captions": strip_caps, "links": strip_lnks}
+        _STATE["strip"] = {"captions": strip_caps, "links": strip_lnks}
+    except Exception:
+        logger.debug("could not load strip settings (non-fatal)", exc_info=True)
 
     if cfg.has_user_session:
         # Telethon connects in the BACKGROUND with its own retry loop — a bad
@@ -748,6 +798,7 @@ async def _run_webhook_custom(app: Application, cfg: Config) -> None:
                     body += (f"telethon_probe: FAIL {probe.get('error')}\n")
                     if probe.get("verdict"):
                         body += f"telethon_verdict: {probe['verdict']}\n"
+        body += _health_runtime_lines(state)
         body += f"rss_mb: {_rss_mb():.0f}\n"
         return web.Response(text=body, status=200, content_type="text/plain")
 
@@ -1073,6 +1124,7 @@ async def _run_polling_with_dashboard(app: Application, cfg: Config) -> None:
                 body += f"error: {_scrub(cfg, state['error'])}\n"
                 body += f"hint: {state['hint']}\n"
         body += f"telethon: {_scrub(cfg, str(state.get('user_session', '?')))}\n"
+        body += _health_runtime_lines(state)
         body += f"rss_mb: {_rss_mb():.0f}\n"
         return web.Response(text=body, status=200, content_type="text/plain")
 

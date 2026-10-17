@@ -98,6 +98,11 @@ class Config:
     # --- free-tier keep-alive ---
     keep_alive: bool = True            # self-ping to avoid Render sleeping
     keep_alive_interval: int = 540     # seconds (9 min < Render's 15-min limit)
+    # --- forward cleaning (/strip) ---
+    # Env defaults only — the /strip command flips them at runtime and the
+    # DB value wins over these on every boot.
+    strip_captions: bool = False       # STRIP_CAPTIONS=true -> media forwards lose captions
+    strip_links: bool = False          # STRIP_LINKS=true -> URLs removed from forwarded text
     # --- misc tuning ---
     log_level: str = "INFO"
     # Non-fatal problems noticed while loading env vars (bad numbers etc.) —
@@ -194,6 +199,8 @@ class Config:
             session_string=session_string,
             keep_alive=_env_bool("KEEP_ALIVE", default=(mode == "webhook")),
             keep_alive_interval=keep_alive_interval,
+            strip_captions=_env_bool("STRIP_CAPTIONS", default=False),
+            strip_links=_env_bool("STRIP_LINKS", default=False),
             log_level=log_level,
             load_issues=issues,
         )

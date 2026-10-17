@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import inspect
 import ipaddress
 import logging
@@ -22,7 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from telethon import TelegramClient
+from telethon import TelegramClient, helpers as _tg_helpers
 from telethon.errors import ChannelPrivateError, InviteHashInvalidError
 from telethon.tl import types as tl
 
@@ -229,6 +230,265 @@ def parse_channel_link(url: str) -> Optional[ParsedLink]:
         return ParsedLink(kind="public", chat_ref=username, message_id=0)
 
     return None
+
+
+# ---------- link stripping (the /strip feature) ----------
+
+# Raw URLs in plain text — catches links even when the message carries no
+# URL entities at all (plain-text posts, some clients). Matches http(s)
+# links, www. links, and scheme-less t.me / telegram.me deep links.
+URL_TEXT_RE = re.compile(
+    r"(?:https?://\S+|www\.\S+|\bt\.me/\S+|\btelegram\.me/\S+)",
+    re.IGNORECASE,
+)
+
+
+def _merge_ranges(ranges: list) -> list:
+    """Sort + merge overlapping (start, end) ranges."""
+    merged: list = []
+    for s, e in sorted(ranges):
+        if merged and s <= merged[-1][1]:
+            if e > merged[-1][1]:
+                merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _remove_ranges(s: str, ranges: list) -> str:
+    out, cur = [], 0
+    for s_, e_ in ranges:
+        out.append(s[cur:s_])
+        cur = e_
+    out.append(s[cur:])
+    return "".join(out)
+
+
+def _post_removal_cleanup_ranges(orig: str, inter: str) -> list:
+    """Extra ranges to remove AFTER link removal so the remaining text reads
+    naturally instead of showing the holes where links used to be:
+
+      * runs of 2+ spaces collapse to one (a URL between two words leaves
+        "word  word" otherwise)
+      * spaces directly before a newline / at the end of the text vanish
+      * a line that BECAME empty because its only content was a link is
+        deleted entirely (link-on-its-own-line posts)
+      * runs of intentionally-blank lines collapse to a single blank line
+
+    `orig` is the text BEFORE link removal, `inter` AFTER — both in the same
+    surrogate-aware index space. No removed range ever contains a newline,
+    so the two texts have identical line structure and we can compare line
+    by line. Returns extra (start, end) ranges to remove.
+    """
+    extra: list = []
+
+    # 1) collapse runs of 2+ spaces/tabs into one
+    for m in re.finditer(r"[ \t]{2,}", inter):
+        extra.append((m.start() + 1, m.end()))
+
+    # 2) spaces hanging right before a newline or at the very end
+    for m in re.finditer(r"[ \t]+(?:\n|$)", inter):
+        ends_with_nl = m.group().endswith("\n")
+        extra.append((m.start(), m.end() - (1 if ends_with_nl else 0)))
+
+    if "\n" in inter:
+        # 3) line-level cleanup (line indexes are identical in orig/inter)
+        starts, pos = [], 0
+        for line in inter.split("\n"):
+            starts.append(pos)
+            pos += len(line) + 1
+        orig_lines = orig.split("\n")
+        inter_lines = inter.split("\n")
+        n = len(inter_lines)
+        to_delete: list[int] = []
+        blank_run: list[int] = []
+
+        def _flush_run() -> None:
+            # Keep the FIRST blank of a run only when it was blank in the
+            # original too (an intentional separator, not a hole) and it is
+            # not the first/last line of the text.
+            for k, idx in enumerate(blank_run):
+                keep = (k == 0 and 0 < idx < n - 1
+                        and orig_lines[idx].strip() == "")
+                if not keep:
+                    to_delete.append(idx)
+            blank_run.clear()
+
+        for i, (o_line, n_line) in enumerate(zip(orig_lines, inter_lines)):
+            if n_line.strip() == "":
+                if o_line.strip() != "":
+                    to_delete.append(i)   # became empty — its content was a link
+                else:
+                    blank_run.append(i)   # was already blank — intentional
+            else:
+                _flush_run()
+        _flush_run()
+
+        for i in to_delete:
+            if i + 1 < n:
+                # the line plus its trailing newline
+                extra.append((starts[i], starts[i] + len(inter_lines[i]) + 1))
+            else:
+                # last line — eat the preceding newline instead
+                extra.append((max(0, starts[i] - 1), len(inter)))
+
+    return extra
+
+
+def strip_links_from_text(text: str, entities=None) -> tuple[str, object, bool]:
+    """Remove every link from `text`, keeping everything else intact.
+
+    Handles all three ways links appear in Telegram messages:
+      * raw URL text (https://…, www.…, t.me/…) — the URL substring is
+        deleted, even when the message has no entities at all
+      * MessageEntityUrl — same, using the entity's exact range
+      * MessageEntityTextUrl ("click [here]" hyperlinks) — the visible text
+        is KEPT, only the link behind it is dropped
+
+    Non-link entities (bold, italic, hashtags, mentions…) survive with
+    their offsets shifted to match the new text. Entity offsets are UTF-16
+    based (Telegram convention), so all range math runs on the surrogate-
+    aware form of the text via Telethon's helpers.
+
+    Returns (new_text, new_entities_or_None, changed). `changed` is False
+    only when nothing needed stripping (text and entities come back as-is)
+    — callers use it to keep Telegram's fast true-forward path when there
+    is nothing to clean.
+    """
+    if not text:
+        return text, entities, False
+    s16 = _tg_helpers.add_surrogate(text)
+    removals: list = []
+    has_text_url = False
+    for e in entities or []:
+        if isinstance(e, tl.MessageEntityUrl):
+            removals.append((e.offset, e.offset + e.length))
+        elif isinstance(e, tl.MessageEntityTextUrl):
+            has_text_url = True   # visible text stays; the hyperlink is dropped
+    for m in URL_TEXT_RE.finditer(s16):
+        removals.append((m.start(), m.end()))
+    if not removals and not has_text_url:
+        return text, entities, False
+
+    # Two-pass removal: the URL ranges live in the ORIGINAL index space, the
+    # cleanup ranges (collapsed spaces, deleted lines) are computed on the
+    # text AFTER pass 1 — so pass 2 must apply them to `inter`, not to the
+    # original. Entity offsets shift once per pass.
+    removals = _merge_ranges(removals)
+    inter = _remove_ranges(s16, removals)
+    extra = _post_removal_cleanup_ranges(s16, inter)
+    out = _remove_ranges(inter, extra)
+
+    kept_entities = []
+    for e in entities or []:
+        if isinstance(e, (tl.MessageEntityUrl, tl.MessageEntityTextUrl)):
+            continue
+        s_, e_ = e.offset, e.offset + e.length
+        # pass 1: does the entity overlap a removed URL span?
+        if any(s_ < r[1] and r[0] < e_ for r in removals):
+            continue
+        inter_off = s_ - sum(r[1] - r[0] for r in removals if r[1] <= s_)
+        inter_end = inter_off + e.length
+        # pass 2: does it overlap a cleanup span in the intermediate text?
+        if any(inter_off < r[1] and r[0] < inter_end for r in extra):
+            continue
+        final_off = inter_off - sum(r[1] - r[0] for r in extra
+                                    if r[1] <= inter_off)
+        try:
+            ne = copy.copy(e)
+            ne.offset = final_off
+            kept_entities.append(ne)
+        except Exception:
+            logger.debug("entity copy failed during link strip", exc_info=True)
+
+    new_text = _tg_helpers.del_surrogate(out)
+    # If we got here at least one link was found, so the message content DID
+    # change (even when the visible text is identical — a hyperlink was
+    # removed from behind it).
+    return new_text, (kept_entities or None), True
+
+
+def text_has_links(text: str, entities=None) -> bool:
+    """True when `text` contains any link (URL entity, text-url entity, or a
+    raw URL in the text itself)."""
+    if not text:
+        return False
+    if any(isinstance(e, (tl.MessageEntityUrl, tl.MessageEntityTextUrl))
+           for e in (entities or [])):
+        return True
+    return bool(URL_TEXT_RE.search(text))
+
+
+# ---------- from-point scraping (post link + #old / #new) ----------
+
+# Matches the direction hashtag in a plain message: #old / #new with an
+# optional count baked in (#new120) or as a separate number after it.
+SCRAPE_POINT_TAG_RE = re.compile(r"#(old|new)(\d{1,4})?\b", re.IGNORECASE)
+
+
+def parse_scrape_point_request(text: str) -> Optional[tuple[ParsedLink, str, int]]:
+    """Detect a from-point scrape request in a plain (non-command) message.
+
+    Triggers when the message contains BOTH:
+      * a post link — t.me/<channel>/<msg_id> or t.me/c/<id>/<msg_id>
+      * a direction hashtag — #old (walk back in history from that post) or
+        #new (walk forward), with an optional count: "#new", "#new120" or
+        "#new 120" (default 50, clamped to 500)
+
+    This is the "send a post link with a flag" flow: the admin forwards a
+    message from the source channel with #old/#new appended and the bot
+    scrapes from exactly that point. Returns (ParsedLink, direction, count)
+    or None when the message is not a from-point request.
+    """
+    if not text:
+        return None
+    m = SCRAPE_POINT_TAG_RE.search(text)
+    if not m:
+        return None
+    link = parse_telegram_link(text)
+    if not link:
+        return None   # hashtag but no post link (e.g. a channel-only link)
+    direction = m.group(1).lower()
+    count = int(m.group(2)) if m.group(2) else 50
+    if not m.group(2):
+        # optional separate number right after the hashtag ("#new 120")
+        rest = text[m.end():m.end() + 12].lstrip()
+        num = re.match(r"(\d{1,4})\b", rest)
+        if num:
+            count = int(num.group(1))
+    return link, direction, max(1, min(count, 500))
+
+
+def order_messages_for_delivery(msgs: list, direction: str) -> list:
+    """Order messages fetched around an anchor point for delivery.
+
+    'old'  — fetched newest→oldest (iter_messages walked backward from the
+             anchor), so the list is reversed into chronological order and
+             the destination reads like the source channel does
+    'new'  — already fetched chronologically (reverse=True), pass-through
+
+    Album runs (consecutive messages sharing a grouped_id) are re-sorted
+    ascending by id in both cases — reversing the whole batch would flip
+    the items inside each album, and forward_messages/send_file send album
+    items in the order they're given.
+    """
+    out = list(msgs)
+    if direction == "old":
+        out.reverse()
+    fixed: list = []
+    i = 0
+    while i < len(out):
+        gid = getattr(out[i], "grouped_id", None)
+        if not gid:
+            fixed.append(out[i])
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(out) and getattr(out[j + 1], "grouped_id", None) == gid:
+            j += 1
+        fixed.extend(sorted(out[i:j + 1], key=lambda m: m.id))
+        i = j + 1
+    return fixed
 
 
 # ---------- session manager ----------
@@ -884,6 +1144,8 @@ class UserSession:
         pre_messages: list | None = None,
         source_entity=None,
         dest_entity=None,
+        strip_captions: bool = False,
+        strip_links: bool = False,
     ) -> tuple[bool, list[str]]:
         """Send message(s) from a source chat to the destination chat using
         the user account (Telethon). This is the fast path that avoids
@@ -934,31 +1196,51 @@ class UserSession:
                     f"from {source_chat_id} to {dest_chat_id}"
                     f"{f' topic {topic_id}' if topic_id else ''}")
 
-        # Helper: compute the effective caption based on custom_caption policy
-        # - custom_caption=None: use original caption (msg.message)
+        # Helper: compute the effective caption based on the custom_caption
+        # policy AND the /strip settings:
+        # - custom_caption=None: original caption, then optionally cleaned
+        #     by strip_captions (media captions removed) / strip_links
+        #     (URLs deleted from whatever text survives)
         # - custom_caption="" (empty string): strip ALL captions
         # - custom_caption="<text>": use this string for the first item only
         #   (albums only show the first item's caption in Telegram)
         def _caption_for(msg, item_index: int = 0) -> str:
             """Return the caption to send for this message."""
-            if custom_caption is None:
-                # Use original caption (legacy behavior)
-                return msg.message or ""
-            if custom_caption == "":
-                # Strip captions entirely
+            if custom_caption is not None:
+                if custom_caption == "":
+                    # Strip captions entirely
+                    return ""
+                # Use custom caption, but only on the first item of an album
+                return custom_caption if item_index == 0 else ""
+            text = msg.message or ""
+            if item_index > 0:
+                # Album non-first items never carry text in a re-sent album
+                # (Telegram shows only the first item's caption)
                 return ""
-            # Use custom caption, but only on the first item of an album
-            if item_index == 0:
-                return custom_caption
-            return ""
+            if strip_captions and msg.media:
+                # /strip captions — media posts lose their caption entirely.
+                # Text-only posts are NOT affected: the text IS the content.
+                return ""
+            if strip_links and text:
+                new_text, _ents, _chg = strip_links_from_text(text, msg.entities)
+                return new_text
+            return text
 
         def _formatting_entities_for(msg, item_index: int = 0):
-            """Return formatting entities to preserve. When using a custom
-            caption, we strip entities (they wouldn't match the new text)."""
-            if custom_caption is None:
-                return msg.entities if item_index == 0 else None
-            # Strip formatting entities when using custom caption
-            return None
+            """Return formatting entities to preserve. Custom captions lose
+            entities entirely; link-stripped text keeps its surviving
+            entities (offsets already shifted by strip_links_from_text)."""
+            if custom_caption is not None:
+                return None
+            if item_index > 0:
+                return None
+            text = msg.message or ""
+            if strip_captions and msg.media:
+                return None
+            if strip_links and text:
+                _t, ents, changed = strip_links_from_text(text, msg.entities)
+                return ents if changed else msg.entities
+            return msg.entities
 
         try:
             if source_entity is None:
@@ -997,10 +1279,28 @@ class UserSession:
                 return False, diag
 
         # ---- Step 1: try true forward (works for non-protected content) ----
-        # Skip this step if a custom_caption is set — forward_messages doesn't
-        # let us override the caption, so we need to use the send_message path
-        # (which DOES let us set the caption) for caption control.
-        if custom_caption is None:
+        # Skip this step when the text of ANY message would change under the
+        # caption/link settings — forward_messages copies the source text
+        # verbatim and cannot be edited afterwards, so caption control
+        # (custom_caption, strip_captions, strip_links) needs the re-send
+        # path below (which DOES let us set the caption).
+        def _text_would_change(msg, item_index: int) -> bool:
+            if item_index > 0:
+                # Album non-first items carry no text after a re-send either
+                # way — they can't force the slow path on their own.
+                return False
+            if custom_caption is not None:
+                return (msg.message or "") != (""
+                                                if custom_caption == ""
+                                                else custom_caption)
+            text = msg.message or ""
+            if strip_captions and msg.media and text:
+                return True
+            if strip_links and text and text_has_links(text, msg.entities):
+                return True
+            return False
+
+        if not any(_text_would_change(m, i) for i, m in enumerate(messages)):
             try:
                 # Build reply_to for topics if specified
                 kwargs: dict = {}
@@ -1024,14 +1324,25 @@ class UserSession:
                 diag.append(f"⚠ True forward failed: {type(forward_err).__name__}: {forward_err}")
                 diag.append("  → Falling back to copy-and-resend (for protected content)")
         else:
-            diag.append("ℹ Skipping true forward (custom_caption is set — using send_message)")
+            diag.append("ℹ Skipping true forward (caption/link settings modify "
+                        "the text — using the re-send path)")
 
         # ---- Step 2: fallback — re-upload via send_message(file=msg.media) ----
         # This bypasses the noforwards restriction by re-uploading from
         # Telegram's servers directly (no disk download).
         sent_count = 0
+        skipped_no_text = 0
         last_error = None
         for i, msg in enumerate(messages):
+            # A text-only message whose text vanished entirely after link
+            # stripping has nothing left to forward — count it as skipped
+            # instead of trying to send an empty message (Telegram would
+            # reject it anyway).
+            if not msg.media and not (_caption_for(msg, i) or "").strip():
+                skipped_no_text += 1
+                diag.append(f"↷ Message {i+1}/{len(messages)} skipped — "
+                            f"text-only and empty after link stripping")
+                continue
             try:
                 send_kwargs = dict(
                     message=_caption_for(msg, i),
@@ -1070,6 +1381,10 @@ class UserSession:
         elif sent_count > 0:
             diag.append(f"⚠ Partial success: {sent_count}/{len(messages)} sent")
             return True, diag
+        if skipped_no_text == len(messages):
+            diag.append("✓ Nothing to send — every message was text-only and "
+                        "empty after link stripping")
+            return True, diag
 
         # ---- Step 3: third fallback — download to disk + send_file ----
         # The "send_message(file=msg.media)" path fails with
@@ -1095,7 +1410,13 @@ class UserSession:
             sent_count = 0
             for i, msg in enumerate(messages):
                 if not msg.media:
-                    # Text-only message — just send the text
+                    # Text-only message — just send the text (unless link
+                    # stripping left it completely empty)
+                    if not (_caption_for(msg, i) or "").strip():
+                        skipped_no_text += 1
+                        diag.append(f"↷ Message {i+1}/{len(messages)} skipped — "
+                                    f"text-only and empty after link stripping")
+                        continue
                     try:
                         send_kwargs = dict(
                             message=_caption_for(msg, i),
@@ -2062,10 +2383,365 @@ class UserSession:
 
         return result
 
+    # ---------- from-point scraping (post link + old/new) ----------
+
+    async def scrape_from_point(
+        self,
+        source_chat_ref,
+        anchor_message_id: int,
+        direction: str,
+        dest_chat_id,
+        count: int = 50,
+        topic_id: int | None = None,
+        cancel_event=None,
+        status_callback=None,
+        stats_callback=None,
+        media_types: list[str] | None = None,
+        parallel: int = 3,
+        custom_caption: str | None = None,
+        strip_captions: bool = False,
+        strip_links: bool = False,
+    ) -> dict:
+        """Scrape a channel/group FROM a specific post, in a specific
+        direction — the "send a post link with a flag" flow.
+
+        Direction:
+          'old' — the anchor post plus the `count`-1 posts BEFORE it
+                  (walking back in history). Fetched with
+                  offset_id=anchor+1, then reversed so the destination
+                  receives them chronologically (reads like the source).
+          'new' — the anchor post plus the `count`-1 posts AFTER it
+                  (walking toward the present). Fetched with
+                  min_id=anchor-1, reverse=True (already chronological).
+
+        Differences from scrape_channel (whole-channel):
+          * bounded — exactly `count` messages max (default 50, clamp 500),
+            not the entire history
+          * media_types=None means EVERYTHING (text posts included — this is
+            a point mirror, not a media dump); pass a type list to filter
+          * the anchor post itself IS included in both directions
+
+        Returns the same dict as scrape_channel, plus anchor_id, direction,
+        fetched_count, first_sent_id and last_sent_id (so the status message
+        can tell the user exactly which range was covered and where to
+        continue from).
+        """
+        from telethon.errors import FloodWaitError
+        import asyncio as _asyncio
+
+        direction = (direction or "old").lower()
+        if direction not in ("old", "new"):
+            if status_callback:
+                await status_callback(f"❌ Unknown direction {direction!r} — "
+                                      "use 'old' or 'new'.")
+            return {"sent_count": 0, "failed_count": -1, "skipped_count": 0,
+                    "total_seen": 0, "last_message_id": 0, "cancelled": False,
+                    "flood_waits": 0, "anchor_id": anchor_message_id,
+                    "direction": direction, "fetched_count": 0,
+                    "first_sent_id": 0, "last_sent_id": 0}
+        count = max(1, min(int(count or 50), 500))
+
+        result = {
+            "sent_count": 0, "failed_count": 0, "skipped_count": 0,
+            "total_seen": 0, "last_message_id": 0, "cancelled": False,
+            "flood_waits": 0,
+            "anchor_id": anchor_message_id, "direction": direction,
+            "fetched_count": 0, "first_sent_id": 0, "last_sent_id": 0,
+        }
+
+        # Normalize media filters (same rules as scrape_channel)
+        if media_types is not None:
+            media_types = [t.lower() for t in media_types]
+            valid = {"photo", "video", "animation", "document", "audio", "voice"}
+            invalid = set(media_types) - valid
+            if invalid:
+                if status_callback:
+                    await status_callback(f"❌ Invalid media types: {invalid}")
+                result["failed_count"] = -1
+                return result
+
+        try:
+            source_entity = await self._get_entity_with_warmup(source_chat_ref)
+            dest_entity = await self._get_entity_with_warmup(dest_chat_id)
+        except Exception as e:
+            if status_callback:
+                await status_callback(
+                    f"❌ Failed to resolve entities: {type(e).__name__}: {e}")
+            result["failed_count"] = -1
+            return result
+
+        src_title = getattr(source_entity, "title", None) or str(source_chat_ref)
+        if status_callback:
+            arrow = "⬅ older posts" if direction == "old" else "➡ newer posts"
+            await status_callback(
+                f"🔍 Scraping “{src_title}” from post #{anchor_message_id} "
+                f"({arrow}, up to {count} messages)…"
+            )
+
+        # ---- fetch phase ----
+        try:
+            if direction == "old":
+                # Messages at/below the anchor, walking back, newest first.
+                # offset_id is exclusive, so anchor+1 includes the anchor.
+                it = self.client.iter_messages(
+                    source_entity,
+                    offset_id=anchor_message_id + 1,
+                    limit=count,
+                )
+            else:
+                kw = {"reverse": True, "limit": count}
+                if anchor_message_id - 1 > 0:
+                    # min_id is exclusive — anchor-1 includes the anchor
+                    kw["min_id"] = anchor_message_id - 1
+                it = self.client.iter_messages(source_entity, **kw)
+            fetched: list = []
+            async for m in it:
+                if cancel_event and cancel_event.is_set():
+                    break
+                fetched.append(m)
+        except Exception as e:
+            logger.exception("scrape_from_point: fetch failed")
+            if status_callback:
+                await status_callback(f"❌ Fetch failed: {type(e).__name__}: {e}")
+            result["failed_count"] = -1
+            return result
+
+        result["fetched_count"] = len(fetched)
+
+        if not fetched:
+            if status_callback:
+                if direction == "new":
+                    await status_callback(
+                        f"✅ No messages at or after #{anchor_message_id} — "
+                        f"the anchor is the newest post (or was deleted).")
+                else:
+                    await status_callback(
+                        f"✅ No messages at or before #{anchor_message_id} — "
+                        f"nothing to scrape in that direction.")
+            return result
+
+        # Chronological delivery order + album items sorted by id
+        ordered = order_messages_for_delivery(fetched, direction)
+
+        if status_callback:
+            lo, hi = ordered[0].id, ordered[-1].id
+            await status_callback(
+                f"📥 Fetched {len(ordered)} message(s) "
+                f"(#{lo} … #{hi}). Sending to destination…"
+            )
+
+        # ---- send phase (same dispatch pattern as scrape_channel) ----
+        def _classify_media(msg) -> str | None:
+            if not msg.media:
+                return None
+            if isinstance(msg.media, tl.MessageMediaPhoto):
+                return "photo"
+            if isinstance(msg.media, tl.MessageMediaDocument):
+                doc = msg.media.document
+                if not doc or not doc.mime_type:
+                    return "document"
+                mt = doc.mime_type
+                if mt.startswith("video/"):
+                    for attr in (doc.attributes or []):
+                        if isinstance(attr, tl.DocumentAttributeAnimated):
+                            return "animation"
+                        if isinstance(attr, tl.DocumentAttributeVideo):
+                            return ("video_note" if getattr(attr, "round_message", False)
+                                    else "video")
+                    return "video"
+                if mt.startswith("audio/"):
+                    for attr in (doc.attributes or []):
+                        if isinstance(attr, tl.DocumentAttributeAudio) and getattr(attr, "voice", False):
+                            return "voice"
+                    return "audio" if "ogg" not in mt else "voice"
+                return "document"
+            return None   # web pages, contacts, geos, polls, ...
+
+        async def _send_batch(msgs: list) -> bool:
+            ids = [m.id for m in msgs]
+            kwargs = dict(
+                source_chat_id=source_entity.id,
+                source_message_ids=ids,
+                dest_chat_id=dest_chat_id,
+                topic_id=topic_id,
+                custom_caption=custom_caption,
+                strip_captions=strip_captions,
+                strip_links=strip_links,
+                pre_messages=msgs,
+                source_entity=source_entity,
+                dest_entity=dest_entity,
+            )
+            try:
+                success, _ = await self.send_to_destination(**kwargs)
+                if success:
+                    result["sent_count"] += len(msgs)
+                    if not result["first_sent_id"]:
+                        result["first_sent_id"] = min(ids)
+                    result["last_sent_id"] = max(ids)
+                    return True
+                result["failed_count"] += len(msgs)
+                return False
+            except FloodWaitError as e:
+                result["flood_waits"] += 1
+                wait_seconds = e.seconds + 5
+                if status_callback:
+                    await status_callback(
+                        f"⏳ Flood wait: sleeping {wait_seconds}s before retrying…\n"
+                        f"   Sent so far: {result['sent_count']}")
+                await _asyncio.sleep(wait_seconds)
+                try:
+                    success, _ = await self.send_to_destination(**kwargs)
+                    if success:
+                        result["sent_count"] += len(msgs)
+                        if not result["first_sent_id"]:
+                            result["first_sent_id"] = min(ids)
+                        result["last_sent_id"] = max(ids)
+                        return True
+                except Exception:
+                    pass
+                result["failed_count"] += len(msgs)
+                return False
+            except Exception as e:
+                logger.warning("scrape_from_point: failed to send msgs %s: %s",
+                               ids, e)
+                result["failed_count"] += len(msgs)
+                return False
+
+        sem = _asyncio.Semaphore(parallel)
+        pending_send_tasks: list = []
+
+        async def _send_with_semaphore(msgs: list):
+            async with sem:
+                if cancel_event and cancel_event.is_set():
+                    return False
+                await _send_batch(msgs)
+                await _asyncio.sleep(0.3)
+
+        album_buffer: list = []
+        album_grouped_id = None
+
+        def _flush_album():
+            nonlocal album_buffer, album_grouped_id
+            if album_buffer:
+                batch, album_buffer = album_buffer, []
+                album_grouped_id = None
+                pending_send_tasks.append(
+                    _asyncio.create_task(_send_with_semaphore(batch)))
+
+        last_status_time = 0.0
+        for msg in ordered:
+            if cancel_event and cancel_event.is_set():
+                result["cancelled"] = True
+                break
+            result["total_seen"] += 1
+            result["last_message_id"] = msg.id
+
+            # Service messages (joins, pins, …) carry no forwardable content
+            if getattr(msg, "action", None) or getattr(msg, "service", False):
+                result["skipped_count"] += 1
+                continue
+
+            m_type = _classify_media(msg)
+
+            if media_types is not None:
+                # media filter active: same rules as scrape_channel
+                if m_type is None:
+                    result["skipped_count"] += 1
+                    continue
+                type_check = "video" if m_type == "video_note" else m_type
+                if type_check not in media_types:
+                    result["skipped_count"] += 1
+                    continue
+            else:
+                # No filter: forward EVERYTHING. A text-only post whose text
+                # vanishes entirely under /strip links is skipped BEFORE the
+                # send (send_to_destination guards it too, but skipping here
+                # saves the API round-trip).
+                if (m_type is None and strip_links and custom_caption is None
+                        and not msg.media):
+                    stripped, _e, _c = strip_links_from_text(
+                        msg.message or "", msg.entities)
+                    if not (stripped or "").strip():
+                        result["skipped_count"] += 1
+                        continue
+
+            gid = getattr(msg, "grouped_id", None)
+            if gid:
+                if album_grouped_id == gid:
+                    album_buffer.append(msg)
+                else:
+                    _flush_album()
+                    album_grouped_id = gid
+                    album_buffer = [msg]
+            else:
+                _flush_album()
+                pending_send_tasks.append(
+                    _asyncio.create_task(_send_with_semaphore([msg])))
+
+            if len(pending_send_tasks) >= parallel * 4:
+                done, pending = await _asyncio.wait(
+                    pending_send_tasks, return_when=_asyncio.FIRST_COMPLETED)
+                for t in done:
+                    try:
+                        t.result()
+                    except Exception:
+                        pass
+                pending_send_tasks = list(pending)
+
+            import time as _time
+            now = _time.time()
+            if status_callback and now - last_status_time > 5.0:
+                last_status_time = now
+                await status_callback(
+                    f"📊 Scraping in progress…\n\n"
+                    f"Sent: {result['sent_count']}\n"
+                    f"Failed: {result['failed_count']}\n"
+                    f"Skipped (filtered/service): {result['skipped_count']}\n"
+                    f"Last msg ID: {result['last_message_id']}")
+
+            if stats_callback:
+                try:
+                    await stats_callback(result)
+                except Exception:
+                    pass
+
+        _flush_album()
+        if pending_send_tasks:
+            try:
+                await _asyncio.gather(*pending_send_tasks, return_exceptions=True)
+            except Exception:
+                pass
+
+        if status_callback:
+            if result["cancelled"]:
+                await status_callback(
+                    f"🛑 Scraping cancelled.\n"
+                    f"   Sent: {result['sent_count']}, "
+                    f"Failed: {result['failed_count']}, "
+                    f"Skipped: {result['skipped_count']}")
+            else:
+                ran = (f"#{result['first_sent_id']} … #{result['last_sent_id']}"
+                       if result["first_sent_id"] else "(none)")
+                await status_callback(
+                    f"✅ From-point scrape complete!\n\n"
+                    f"Range: {ran}\n"
+                    f"Fetched: {result['fetched_count']}\n"
+                    f"Sent: {result['sent_count']}\n"
+                    f"Failed: {result['failed_count']}\n"
+                    f"Skipped (filtered/service): {result['skipped_count']}\n"
+                    f"Flood waits: {result['flood_waits']}\n\n"
+                    f"To continue exactly where this stopped, send the link "
+                    f"of the last message with #old / #new again.")
+        return result
+
 
 __all__ = [
     "UserSession",
     "ParsedLink",
     "parse_telegram_link",
     "parse_channel_link",
+    "strip_links_from_text",
+    "text_has_links",
+    "parse_scrape_point_request",
+    "order_messages_for_delivery",
 ]

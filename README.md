@@ -166,12 +166,17 @@ Iterates ALL messages in the channel and sends media in parallel. See [Scraping]
 | `/test_link <url>` | Diagnostic: test fetching a t.me link (shows step-by-step report) |
 | `/saved <url>` | 🚀 FAST: send t.me link content directly to Saved Messages |
 | `/scrape <url> [flags]` | 🤖 AUTO: scrape ALL media from a channel |
+| `/scrape <post_link> old\|new [N]` | 🎯 scrape FROM that post — back in history (`old`) or toward the newest posts (`new`) |
 | `/stop_scrape` | 🛑 stop the active scrape |
 | `/scrape_status` | 📊 check scrape progress (shows `Last msg ID` — use it with `min=N` to resume) |
 | `/caption <text>` | 📝 set a custom caption (replaces original on all forwards) |
 | `/caption strip` | 📝 strip ALL captions from forwarded media |
 | `/caption clear` | 📝 restore original caption behavior |
+| `/strip` | 🧹 toggle stripping captions / links on every forward |
 | `/cancel` | Cancel any pending forward for this chat |
+
+You can also trigger a from-point scrape **without a command**: send (or forward) a post
+link with `#old` / `#new` appended — see [Scraping from a specific post](#scraping-from-a-specific-post-old--new).
 
 ---
 
@@ -227,6 +232,44 @@ When set to "clear" (None), original captions are preserved (legacy behavior).
 
 ---
 
+## /strip — strip captions & links on forward
+
+`/strip` controls two independent cleaning toggles applied to **every sourced
+forward** (post links, `/saved`, `/scrape`, from-point scraping). Content you
+upload directly to the bot is never modified.
+
+```
+/strip                   ← show current settings
+/strip on   / off        ← both toggles at once
+/strip captions on|off   ← media posts forwarded WITHOUT their caption
+/strip links on|off      ← URLs & hyperlinks removed from forwarded text
+```
+
+### What each toggle does
+
+- **`captions on`** — media posts (photo/video/document/…) arrive with no
+  caption at all. Text-only posts are NOT affected — their text is the
+  content, not a caption.
+- **`links on`** — every link is removed from the text that survives:
+  raw URLs (`https://…`, `www.…`, `t.me/…`), URL entities, and "click
+  *here*" hyperlinks (the visible text stays, the link behind it goes).
+  Bold/italic/hashtag formatting survives with offsets shifted. Doubled
+  spaces collapse, a line that only held a link disappears, and a post
+  that is *just* links is skipped entirely.
+
+### Notes
+
+- The settings persist across restarts (SQLite) and can be seeded with the
+  `STRIP_CAPTIONS` / `STRIP_LINKS` env vars.
+- A custom caption set with `/caption <text>` still wins over the captions
+  toggle until you `/caption clear`.
+- Smart fast path: messages that wouldn't change (no links, empty caption)
+  still go through Telegram's native forward — no re-upload cost.
+- Current state is visible in `/status`, on the web dashboard
+  ("Forward cleaning" card) and in `/health`.
+
+---
+
 ## Scraping
 
 `/scrape <url> [flags]` is the most powerful command — it iterates all messages in a channel and forwards each media message to your destination.
@@ -255,6 +298,42 @@ When set to "clear" (None), original captions are preserved (legacy behavior).
 
 If no media type filter is specified, ALL media is forwarded.
 
+### Scraping from a specific post (`old` / `new`)
+
+Give `/scrape` a **post link** plus a direction and it scrapes from exactly
+that point instead of the whole channel — or skip the command entirely and
+just append the hashtag to a link:
+
+```
+/scrape https://t.me/c/1234567890/42 new        # post #42 + the next 49 posts
+/scrape https://t.me/somechannel/500 old 100    # post #500 + the previous 99
+/scrape https://t.me/c/1234567890/42 new videos # from that point, videos only
+
+https://t.me/c/1234567890/42 #new               # same, bare-message form
+https://t.me/somechannel/500 #old 200           # bare form with a count
+```
+
+| Flag | Effect |
+|---|---|
+| `old` | Walk **back in history** from the linked post (inclusive) |
+| `new` | Walk **toward the newest posts** from the linked post (inclusive) |
+| `<count>` / `count=N` / `#old100` | Max messages per run (default 50, max 500) |
+| `#old` / `#new` | Same directions in a bare message (no command needed) |
+
+Differences from whole-channel scraping:
+
+- **Everything is forwarded** — text posts included — unless you add a media
+  filter. From-point scraping mirrors the channel, not just its media.
+- Messages are delivered in **chronological order** (the destination reads
+  like the source); albums keep their item order.
+- The final status message shows the exact range covered (`#first … #last`)
+  so you know where to continue from.
+- A post link **without** a direction flag still means "whole channel"
+  (legacy behavior), and a bare link without a hashtag still opens the
+  one-post topic picker — the flag is what selects the scrape behavior.
+- Works with `/strip`, `/caption`, `saved`, and `parallel=N` exactly like
+  whole-channel scraping. `/stop_scrape` cancels it.
+
 ### Examples
 
 ```
@@ -264,6 +343,7 @@ If no media type filter is specified, ALL media is forwarded.
 /scrape https://t.me/c/1234567890 photo video         # only photos + videos
 /scrape https://t.me/c/1234567890 saved old videos parallel=5  # all options
 /scrape https://t.me/c/1234567890 min=1042           # resume after interruption
+/scrape https://t.me/c/1234567890/42 new 100         # from post #42, forward
 ```
 
 ### How it works
