@@ -49,6 +49,12 @@ os.environ.update({
     "DB_PATH": "/tmp/e2e_test.db",
     "KEEP_ALIVE": "true",
     "KEEP_ALIVE_INTERVAL": "60",  # clamped to min 60s — we verify it started, not each ping
+    # Neutralize a real .env in the repo (python-dotenv cannot override
+    # pre-set vars) — without these, a dev's actual SESSION_STRING would
+    # make scenarios 1-2 start a REAL Telethon session.
+    "SESSION_STRING": "",
+    "ADMIN_IDS": "",
+    "DESTINATION_GROUP_ID": "",
 })
 
 import aiohttp  # noqa: E402

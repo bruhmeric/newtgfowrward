@@ -33,6 +33,26 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         print(f"  ✗ {name} {detail}")
 
 
+# HERMETIC TEST ENV — must be set BEFORE importing the app modules.
+# config.py runs load_dotenv() at import time and python-dotenv never
+# overrides variables that are already set, so pinning every variable here
+# neutralizes a real .env sitting in the repo (e.g. a dev's actual secrets)
+# and keeps the checks deterministic.
+os.environ.update({
+    "BOT_TOKEN": "123456:TEST-token-secret-part",
+    "API_ID": "12345",
+    "API_HASH": "abcdef",
+    "MODE": "webhook",
+    "KEEP_ALIVE": "",              # empty -> _env_bool falls back to the default
+    "SESSION_STRING": "",
+    "ADMIN_IDS": "",
+    "DESTINATION_GROUP_ID": "",
+    "SESSION_NAME": "user_session",
+    "DB_PATH": "unused-by-smoke-tests",
+    "PHONE": "",
+    "LOG_LEVEL": "INFO",
+})
+
 print("== 1. Module imports (catches the Telethon GetForumTopicsRequest bug) ==")
 import config as config_mod          # noqa: E402
 import db as db_mod                  # noqa: E402
@@ -217,6 +237,12 @@ check("hostname classified 'hostname'",
       us_mod.classify_session_address("venus.web.telegram.org") == "hostname")
 check("empty address classified 'unknown'",
       us_mod.classify_session_address("") == "unknown")
+check("in-range DC1 front-door IP (not the canonical one) classified 'telegram'",
+      us_mod.classify_session_address("149.154.175.58") == "telegram")
+check("in-range DC5 IP classified 'telegram'",
+      us_mod.classify_session_address("91.108.58.200") == "telegram")
+check("adjacent non-Telegram range NOT classified 'telegram'",
+      us_mod.classify_session_address("149.155.0.1") == "public")
 
 
 def _make_session_string(dc_id: int, ip: str, port: int = 443) -> str:
@@ -228,6 +254,17 @@ def _make_session_string(dc_id: int, ip: str, port: int = 443) -> str:
     s.set_dc(dc_id, ip, port)
     s._auth_key = AuthKey(data=_os.urandom(256))
     return s.save()
+
+
+def _make_session_string_dialect_b(dc_id: int, host: str, port: int = 443) -> str:
+    """Craft a StringSession in the older length-prefixed-ASCII dialect —
+    the one Telethon 1.40 silently misparses as a garbage IPv6 address
+    (dc_id B + host_len H + ASCII host + port H + 256-byte key)."""
+    import base64 as _b64
+    import os as _os
+    raw = (bytes([dc_id]) + len(host).to_bytes(2, "big")
+           + host.encode("ascii") + port.to_bytes(2, "big") + _os.urandom(256))
+    return "1" + _b64.urlsafe_b64encode(raw).decode("ascii")
 
 
 async def session_diag_tests() -> None:
@@ -246,19 +283,48 @@ async def session_diag_tests() -> None:
           "149.154.167.91" in good._session_target_desc()
           and "DC4" in good._session_target_desc())
 
-    # 9c. private-address session: fail FAST with a clear message, no network
+    # 9c. private-address session (VPN/proxy artifact). With a KNOWN dc_id
+    # the address is overridden with the canonical DC address (the auth key
+    # is DC-bound, so this repairs the session). With an UNKNOWN dc_id there
+    # is no fallback — it must still fail fast with instructions.
     import time as _t
-    bad = us_mod.UserSession(
+    vpn_known_dc = us_mod.UserSession(
         "t", 12345, "abcdef", session_string=_make_session_string(2, "10.6.0.7"))
-    check("private-address session flagged at parse time",
+    check("private address + known DC overridden to canonical DC",
+          vpn_known_dc._init_error is None
+          and vpn_known_dc.session_info.get("server") == "149.154.167.51"
+          and vpn_known_dc.session_info.get("address_kind") == "telegram",
+          f"got server={vpn_known_dc.session_info.get('server')!r} "
+          f"err={vpn_known_dc._init_error!r}")
+    bad = us_mod.UserSession(
+        "t", 12345, "abcdef", session_string=_make_session_string(9, "10.6.0.7"))
+    check("private address + unknown DC still flagged at parse time",
           bad._init_error is not None and "private address" in bad._init_error,
           f"got {bad._init_error!r}")
     t0 = _t.monotonic()
     ok = await bad.start()
-    check("private-address start() fails immediately (<2s, no network)",
+    check("unknown-DC private-address start() fails immediately (<2s, no network)",
           ok is False and (_t.monotonic() - t0) < 2.0)
-    check("private-address reason lands in last_error",
+    check("unknown-DC private-address reason lands in last_error",
           "VPN" in (bad.last_error or "") or "private" in (bad.last_error or ""))
+
+    # 9c2. dialect-B session strings (length-prefixed ASCII address) — the
+    # dialect Telethon 1.40 silently misparses as garbage IPv6
+    from telethon.sessions import StringSession as _SS
+    b_str = _make_session_string_dialect_b(1, "149.154.175.58")
+    raw_loaded = str(_SS(b_str).server_address)
+    check("bug reproduced: Telethon 1.40 alone misreads dialect-B as IPv6 garbage",
+          ":" in raw_loaded and "3134" in raw_loaded, f"got {raw_loaded!r}")
+    fixed = us_mod.UserSession("t", 12345, "abcdef", session_string=b_str)
+    check("dialect-B repaired to the embedded IPv4 address",
+          fixed.session_info.get("server") == "149.154.175.58"
+          and fixed.session_info.get("port") == 443
+          and fixed._init_error is None,
+          f"got {fixed.session_info}")
+    check("dialect-B repaired address classifies as telegram",
+          fixed.session_info.get("address_kind") == "telegram")
+    check("dialect-B auth key preserved (256 bytes)",
+          fixed.session_info.get("auth_key_bytes") == 256)
 
     # 9d. malformed string still caught (regression)
     ugly = us_mod.UserSession("t", 12345, "abcdef", session_string="garbage-not-a-session")
@@ -296,6 +362,20 @@ async def session_diag_tests() -> None:
         bot_mod._USER_SESSION_MGR["us"] = None
 
 asyncio.run(session_diag_tests())
+
+print("== 10. Polling-mode dashboard card (new) ==")
+pcfg = config_mod.Config.load()   # webhook cfg from section 2; override for the check
+pcfg.mode = "polling"
+html_p = bot_mod._render_dashboard(pcfg, {
+    "ready": True, "bot_username": "testbot", "attempts": 1,
+    "webhook_registered": False, "user_session": "connected as @x (1)",
+    "phase": "running", "error": None, "hint": None,
+    "wh_info": None, "wh_info_ts": 0.0,
+})
+check("dashboard shows polling card in polling mode",
+      "polling (long-poll active)" in html_p)
+check("dashboard does not show 'not registered' webhook card in polling mode",
+      "not registered" not in html_p)
 
 print()
 print(f"RESULT: {PASS} passed, {FAIL} failed")

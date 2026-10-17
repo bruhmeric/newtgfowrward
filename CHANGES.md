@@ -3,8 +3,70 @@
 This release fixes several real bugs, hardens the webhook server, and tunes
 the bot specifically for Render's free tier (512 MB RAM / 0.1 CPU / 15-min
 sleep / ephemeral disk). All changes are covered by `smoke_test.py`
-(51 checks) and `webhook_e2e_test.py` (28 checks) — run both locally with
+(61 checks) and `webhook_e2e_test.py` (28 checks) — run both locally with
 `pip install -r requirements.txt` first.
+
+---
+
+## Hotfix 4: THE root cause — session-string dialect mismatch
+
+**Symptom:** Telethon connect timed out on EVERY host (Render: 30 s per
+attempt, forever) even though the SESSION_STRING was valid and the Bot API
+worked fine. First run of the new diagnostics revealed it instantly:
+`SESSION_STRING parsed: DC1 -> e:3134:392e:3135:342e:3137:352e:3538:443`.
+
+### What actually happened
+
+Telethon 1.40 packs the session address as **raw binary IP bytes without a
+length prefix** (`dc_id B + packed-ip 4/16 B + port H + key 256 B`). Some
+session generators (older Telethon and several third-party tools) emit a
+**different dialect**: `dc_id B + ip_len H + ASCII ip + port H + key 256 B`.
+Telethon 1.40 loads that dialect WITHOUT an error — but reads the length
+prefix + ASCII bytes as the IP itself: `\x00\x0e"149.154.175.58"` is 16
+bytes, which `ipaddress.ip_address()` happily interprets as an IPv6
+address → the client dials garbage like `e:3134:392e:...:3538` forever.
+A perfectly good session, permanently unconnectable.
+
+### The fix (user_session.py)
+
+1. **`_compat_parse_session_string()`** — raw-decodes the session string
+   and detects BOTH dialects. The length-prefixed dialect has an exact
+   total-length self-check, so a false positive on a native string is
+   effectively impossible. On mismatch, the session is repaired via
+   `set_dc(dc_id, correct_ip, port)` — the auth key is preserved (and
+   re-attached defensively in case a future Telethon clears it).
+2. **Canonical-DC fallback.** A session whose embedded address is a
+   VPN/proxy artifact (private IP, or any non-Telegram IP) is now
+   redirected to the canonical address of its dc_id — the auth key is
+   bound to the DATA CENTER, not the front-door address, so this repairs
+   the session instead of failing. The old "private address → refuse"
+   fast-fail now applies only when the dc_id is unknown (nothing to fall
+   back to).
+3. **Address classification by routed range.** `classify_session_address`
+   now matches Telegram's officially routed IPv4 ranges (149.154.160.0/20,
+   91.108.0.0/16, …) instead of five exact IPs — genuine front doors like
+   149.154.175.58 are no longer miswarned as "not a known Telegram DC".
+
+Verified live: the previously-doomed session connected within seconds
+(`dialect repaired ... -> DC1 149.154.175.58:443` → probe OK →
+`connected as @…`, 166 dialogs cached).
+
+Also in this release: **polling mode now serves the dashboard** —
+`_run_polling_with_dashboard()` mirrors the webhook runner (port-first
+bind, retry loop, SIGTERM-safe teardown) but pulls updates via
+getUpdates, so the bot is fully usable (and observable) on hosts without
+a public URL. Phase 4/5 detects and deletes a pre-existing webhook
+(one token = one update pipe) and logs it loudly.
+
+### Tests
+
+- `smoke_test.py` **61/61** — new checks: dialect-B misparse reproduced
+  on raw Telethon (documents the bug), dialect-B repair + key
+  preservation, private+known-DC canonical override, private+unknown-DC
+  fail-fast, in-range DC classification, polling dashboard card. Both
+  test files are now hermetic (a real `.env` in the repo no longer
+  changes test outcomes).
+- `webhook_e2e_test.py` **28/28** (unchanged scenarios, env neutralized).
 
 ---
 

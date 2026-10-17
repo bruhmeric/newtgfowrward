@@ -240,10 +240,14 @@ def _render_dashboard(cfg: Config, state: dict) -> str:
     if ready:
         bot_name = f"@{state['bot_username']}" if state.get("bot_username") else "—"
         cards.append(card("Bot", esc(bot_name)))
-        cards.append(card(
-            "Webhook",
-            '<span class="ok">registered</span>' if state.get("webhook_registered")
-            else '<span class="warn">not registered</span>'))
+        if cfg.mode == "polling":
+            cards.append(card("Updates",
+                              '<span class="ok">polling (long-poll active)</span>'))
+        else:
+            cards.append(card(
+                "Webhook",
+                '<span class="ok">registered</span>' if state.get("webhook_registered")
+                else '<span class="warn">not registered</span>'))
     else:
         cards.append(card("Startup phase", esc(str(state.get("phase", "?")))))
         cards.append(card("Startup attempt", esc(str(state.get("attempts", "?")))))
@@ -1029,6 +1033,210 @@ async def _run_webhook_custom(app: Application, cfg: Config) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Polling runner WITH the web dashboard (local dev / hosted preview)
+# ---------------------------------------------------------------------------
+
+async def _run_polling_with_dashboard(app: Application, cfg: Config) -> None:
+    """Polling mode that ALSO serves the dashboard + /health on cfg.port.
+
+    PTB's built-in run_polling() serves no HTTP — fine on a plain dev box,
+    but useless when the bot is previewed on a hosted sandbox or whenever
+    you want the status page while developing. This runner mirrors
+    _run_webhook_custom's lifecycle (port bind first, retry loop, dashboard,
+    SIGTERM-safe teardown) but pulls updates via getUpdates long-polling,
+    so it needs NO public URL.
+
+    NOTE: one bot token has exactly ONE update pipe. If a webhook is
+    registered for this token (e.g. a live Render deployment), getUpdates
+    fails with 409 Conflict — phase 4/5 detects and deletes it (pending
+    updates kept). The other deployment re-registers its webhook on its
+    next restart.
+    """
+    from aiohttp import web
+
+    state = _STATE
+    state.update({
+        "ready": False, "phase": "1/5 bind-port", "error": None, "hint": None,
+        "attempts": 0, "bot_username": None, "webhook_registered": False,
+        "user_session": "starting…", "wh_info": None, "wh_info_ts": 0.0,
+    })
+
+    async def health_handler(request: web.Request) -> web.Response:
+        body = (
+            f"OK\n"
+            f"uptime_sec: {int(time.time() - _STARTED_AT)}\n"
+            f"ready: {state['ready']}\n"
+        )
+        if not state["ready"]:
+            body += f"phase: {state['phase']}\n"
+            if state["error"]:
+                body += f"error: {_scrub(cfg, state['error'])}\n"
+                body += f"hint: {state['hint']}\n"
+        body += f"telethon: {_scrub(cfg, str(state.get('user_session', '?')))}\n"
+        body += f"rss_mb: {_rss_mb():.0f}\n"
+        return web.Response(text=body, status=200, content_type="text/plain")
+
+    async def dashboard_handler(request: web.Request) -> web.Response:
+        return web.Response(text=_render_dashboard(cfg, state),
+                            status=200, content_type="text/html")
+
+    web_app = web.Application()
+    web_app.router.add_get("/", dashboard_handler)
+    web_app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(web_app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", cfg.port)
+    await site.start()
+    logger.info("Status server listening on 0.0.0.0:%d (polling mode)", cfg.port)
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:  # pragma: no cover — non-Unix
+            pass
+
+    STARTUP_TIMEOUT = 90  # seconds (same per-phase ceiling as webhook mode)
+    RETRY_DELAYS = [5, 15, 30, 60, 120, 300]
+
+    async def _teardown_attempt() -> None:
+        try:
+            if app.updater and getattr(app.updater, "running", False):
+                await app.updater.stop()
+        except Exception:
+            logger.debug("updater stop failed (ignored)", exc_info=True)
+        try:
+            if app.running:
+                await app.stop()
+        except Exception:
+            pass
+        try:
+            await app.shutdown()
+        except Exception:
+            pass
+
+    attempt = 0
+    while not stop_event.is_set():
+        attempt += 1
+        state["attempts"] = attempt
+        state["error"] = None
+        state["hint"] = None
+        try:
+            state["phase"] = "2/5 connect-telegram"
+            logger.info("[2/5] Initializing PTB application (attempt %d)...", attempt)
+            await asyncio.wait_for(app.initialize(), timeout=STARTUP_TIMEOUT)
+
+            state["phase"] = "3/5 setup-storage"
+            logger.info("[3/5] Running post_init (DB init, Telethon, TopicManager)...")
+            await asyncio.wait_for(post_init(app), timeout=STARTUP_TIMEOUT)
+
+            if stop_event.is_set():
+                logger.info("Shutdown requested during startup — skipping polling")
+                break
+
+            state["phase"] = "4/5 clear-old-webhook"
+            # A registered webhook makes getUpdates fail with 409 Conflict.
+            # If this token is currently pointed at a webhook (e.g. the
+            # Render deployment), move it to polling here — log it loudly so
+            # it is never a surprise.
+            wh = await asyncio.wait_for(app.bot.get_webhook_info(),
+                                        timeout=STARTUP_TIMEOUT)
+            if wh and wh.url:
+                logger.info("[4/5] This token has an active webhook (%s) — "
+                            "deleting it so long-polling works. The other "
+                            "deployment (e.g. Render) reclaims the token on "
+                            "its next restart/redeploy.", wh.url)
+                await asyncio.wait_for(
+                    app.bot.delete_webhook(drop_pending_updates=False),
+                    timeout=STARTUP_TIMEOUT)
+            else:
+                logger.info("[4/5] No existing webhook — nothing to clear.")
+
+            state["phase"] = "5/5 start-polling"
+            logger.info("[5/5] Starting Application + getUpdates long-polling...")
+            if app.updater is None:
+                raise RuntimeError("PTB Application has no Updater — cannot poll")
+            await asyncio.wait_for(app.start(), timeout=STARTUP_TIMEOUT)
+            await asyncio.wait_for(
+                app.updater.start_polling(allowed_updates=ALLOWED_UPDATES,
+                                          drop_pending_updates=False),
+                timeout=STARTUP_TIMEOUT)
+
+            state["ready"] = True
+            state["phase"] = "running"
+            logger.info("✓ Bot is LIVE in polling mode — dashboard + /health "
+                        "on port %d", cfg.port)
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            state["error"] = f"{type(exc).__name__}: {exc}"
+            state["hint"] = _startup_hint(exc)
+            logger.error("Startup attempt %d failed at phase '%s': %s",
+                         attempt, state["phase"], _scrub(cfg, state["error"]))
+            logger.error("How to fix: %s", state["hint"])
+            await _teardown_attempt()
+            if stop_event.is_set():
+                break
+            delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
+            logger.warning("Retrying startup in %d s — the dashboard at / shows "
+                           "the error in the meantime", delay)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                break
+            except asyncio.TimeoutError:
+                continue
+
+    if not state["ready"]:
+        logger.error("Shutdown requested before startup succeeded — exiting")
+
+    background_tasks: list[asyncio.Task] = []
+    if state["ready"]:
+        async def housekeeping_loop() -> None:
+            db: Database = app.bot_data["db"]
+            while True:
+                await asyncio.sleep(3600)
+                try:
+                    purged = await db.purge_old_pending(max_age_seconds=3600)
+                    if purged:
+                        logger.info("Housekeeping: purged %d stale pending "
+                                    "forward(s)", purged)
+                except Exception:
+                    logger.debug("housekeeping failed", exc_info=True)
+        background_tasks.append(asyncio.create_task(housekeeping_loop()))
+
+    try:
+        await stop_event.wait()
+        logger.info("Shutdown signal received — draining...")
+    finally:
+        logger.info("Shutting down polling bot...")
+        for t in background_tasks:
+            t.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+        await site.stop()
+        await runner.cleanup()
+        try:
+            if app.updater and getattr(app.updater, "running", False):
+                await app.updater.stop()
+        except Exception:
+            logger.debug("updater stop failed (ignored)", exc_info=True)
+        try:
+            await app.stop()
+        except Exception:
+            logger.debug("app.stop() failed", exc_info=True)
+        try:
+            await post_stop(app)
+        except Exception:
+            logger.exception("post_stop failed")
+        try:
+            await app.shutdown()
+        except Exception:
+            logger.debug("app.shutdown() failed", exc_info=True)
+        logger.info("Shutdown complete (uptime %.0f sec)", time.time() - _STARTED_AT)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -1056,8 +1264,13 @@ def main() -> None:
             logger.exception("Webhook mode crashed")
             sys.exit(1)
     else:
-        # Polling mode (local dev) — use PTB's built-in run_polling
-        app.run_polling(allowed_updates=ALLOWED_UPDATES)
+        # Polling mode (local dev / hosted preview). PTB's run_polling()
+        # serves no HTTP; our runner also brings up the dashboard + /health
+        # and mirrors the webhook runner's retry/teardown behavior.
+        try:
+            asyncio.run(_run_polling_with_dashboard(app, cfg))
+        except KeyboardInterrupt:
+            logger.info("Interrupted")
 
 
 if __name__ == "__main__":

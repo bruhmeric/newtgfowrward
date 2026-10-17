@@ -12,6 +12,7 @@ prompt interactively.
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import ipaddress
 import logging
@@ -51,6 +52,22 @@ TELEGRAM_DC_IPS: dict[int, str] = {
     5: "91.108.56.130",     # DC5 — Singapore
 }
 
+# Telegram's officially routed IPv4 space. A session string may embed ANY
+# address in these ranges — not just the five canonical IPs above (e.g.
+# 149.154.175.58 is a perfectly valid DC1 front door). Range-match instead
+# of exact-matching so genuine Telegram addresses aren't misclassified as
+# "suspicious public IPs".
+TELEGRAM_NETWORKS = [
+    ipaddress.ip_network(n) for n in (
+        "149.154.160.0/20",    # DC1-DC4 (Miami / Amsterdam)
+        "91.105.192.0/23",     # DC2 Amsterdam
+        "91.108.4.0/22",       # DC3 Miami
+        "91.108.8.0/21",       # DC4 Amsterdam
+        "91.108.16.0/21",
+        "91.108.56.0/22",      # DC5 Singapore
+    )
+]
+
 # Process-wide cache for the all-DC sweep so a retrying loop doesn't hammer
 # five datacenters on every attempt — once per process is plenty.
 _DC_SWEEP_CACHE: dict | None = None
@@ -59,19 +76,72 @@ _DC_SWEEP_CACHE: dict | None = None
 def classify_session_address(addr: str) -> str:
     """Classify the server address embedded in a session string.
 
-    Returns 'telegram' (an official DC IP), 'private' (RFC1918/loopback —
-    the string was generated behind a VPN/proxy and can NEVER work from a
-    public host like Render), 'public' (some other global IP — suspicious
-    but still attempted), or 'hostname'."""
+    Returns 'telegram' (an IP inside Telegram's routed ranges), 'private'
+    (RFC1918/loopback — the string was generated behind a VPN/proxy and can
+    NEVER work from a public host like Render), 'public' (some other global
+    IP — suspicious but still attempted), or 'hostname'."""
     if not addr:
         return "unknown"
-    if addr in TELEGRAM_DC_IPS.values():
-        return "telegram"
     try:
         ip = ipaddress.ip_address(addr)
     except ValueError:
         return "hostname"
+    if ip.version == 4 and any(ip in net for net in TELEGRAM_NETWORKS):
+        return "telegram"
     return "public" if ip.is_global else "private"
+
+
+def _compat_parse_session_string(session_string: str):
+    """Raw-decode a Telethon StringSession, handling TWO address dialects.
+
+    Native Telethon 1.40 layout:
+        dc_id (1B) + packed IP (4 or 16 B) + port (2B) + auth key (256B)
+    Older / third-party generator dialect:
+        dc_id (1B) + ip_len (2B) + ASCII IP + port (2B) + auth key (256B)
+
+    Telethon 1.40 only understands the first. A string in the second
+    dialect still parses WITHOUT error — but the length prefix + ASCII
+    bytes get read as the IP itself, producing a garbage IPv6 like
+    'e:3134:392e:31:35:...' that the client then dials forever. Observed in
+    the wild as "connect timed out after 30s" on every host, with a
+    perfectly valid session.
+
+    Returns (dc_id, address, port, dialect) or None if nothing sensible
+    could be extracted. Never raises.
+    """
+    s = session_string
+    if not s or s[0] != "1":
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(s[1:] + "=" * (-len(s[1:]) % 4))
+    except Exception:
+        return None
+    if len(raw) < 260:  # 1 (dc) + 4 (min ip) + 2 (port) + 256 (key) - 3 slack
+        return None
+    dc_id = raw[0]
+    # Dialect B first — its exact total-length self-check makes a false
+    # positive on a native string effectively impossible (the "length"
+    # would have to be the first two bytes of a packed IP AND make the
+    # total come out exactly right).
+    n = int.from_bytes(raw[1:3], "big")
+    if 3 <= n <= 253 and len(raw) == 3 + n + 2 + 256:
+        ip_bytes = raw[3:3 + n]
+        if all(33 <= b <= 126 for b in ip_bytes):  # printable ASCII host
+            host = ip_bytes.decode("ascii", errors="replace")
+            port = int.from_bytes(raw[3 + n:3 + n + 2], "big")
+            if port > 0:
+                return dc_id, host, port, "length-prefixed-ascii"
+    # Dialect A: native packed-binary IP
+    k = len(raw) - 259
+    if k in (4, 16):
+        try:
+            host = str(ipaddress.ip_address(raw[1:1 + k]))
+        except ValueError:
+            host = ""
+        port = int.from_bytes(raw[1 + k:3 + k], "big")
+        if host and port > 0:
+            return dc_id, host, port, "native"
+    return None
 
 
 # ---------- link parsing ----------
@@ -204,10 +274,34 @@ class UserSession:
                 # always a valid TelegramClient; start() refuses to use it.
                 session_obj = StringSession()
             else:
-                # Parse succeeded — introspect what the string actually points
-                # at. NONE of this is secret (the auth key itself never leaves
-                # the process), and it answers the #1 mystery of "connect
-                # timed out": WHICH address was being dialed.
+                # Parse succeeded. FIRST repair address dialects Telethon
+                # 1.40 misparses (see _compat_parse_session_string) — a
+                # valid session in the older dialect otherwise dials a
+                # garbage IPv6 and times out on every host, forever.
+                compat = _compat_parse_session_string(session_string)
+                if compat is not None:
+                    dc_c, addr_c, port_c, dialect = compat
+                    loaded_addr = str(session_obj.server_address or "")
+                    if (addr_c, port_c) != (loaded_addr, session_obj.port):
+                        key_backup = session_obj.auth_key
+                        try:
+                            session_obj.set_dc(dc_c, addr_c, port_c)
+                            if (session_obj.auth_key is None
+                                    and key_backup is not None):
+                                # set_dc must never eat the auth key
+                                session_obj._auth_key = key_backup
+                            logger.info(
+                                "SESSION_STRING dialect repaired ('%s'): "
+                                "%r -> DC%s %s:%s — Telethon misread the "
+                                "address field; the auth key is untouched",
+                                dialect, loaded_addr, dc_c, addr_c, port_c)
+                        except Exception:
+                            logger.debug("dialect repair failed (ignored)",
+                                         exc_info=True)
+                # Then introspect what the string actually points at. NONE
+                # of this is secret (the auth key itself never leaves the
+                # process), and it answers the #1 mystery of "connect timed
+                # out": WHICH address was being dialed.
                 try:
                     key_len = 0
                     if session_obj.auth_key is not None:
@@ -224,27 +318,53 @@ class UserSession:
                         session_obj.port, key_len)
                 except Exception:
                     logger.debug("session introspection failed", exc_info=True)
-                kind = classify_session_address(str(self.session_info.get("server") or ""))
+                kind = classify_session_address(
+                    str(self.session_info.get("server") or ""))
+                # The embedded address is NOT a usable Telegram endpoint — a
+                # VPN/proxy artifact, a misparse, or some random IP. The auth
+                # key is bound to the DATA CENTER, not to the front-door
+                # address, so dialing the canonical DC address is safe and
+                # repairs the session instead of failing.
+                if kind not in ("telegram", "hostname"):
+                    dc_id = self.session_info.get("dc_id")
+                    try:
+                        canonical = TELEGRAM_DC_IPS.get(int(dc_id)) if dc_id else None
+                    except (TypeError, ValueError):
+                        canonical = None
+                    if canonical:
+                        old_addr = self.session_info.get("server")
+                        port = int(self.session_info.get("port") or 443)
+                        key_backup = session_obj.auth_key
+                        try:
+                            session_obj.set_dc(int(dc_id), canonical, port)
+                            if (session_obj.auth_key is None
+                                    and key_backup is not None):
+                                session_obj._auth_key = key_backup
+                            self.session_info["server"] = canonical
+                            kind = "telegram"
+                            logger.warning(
+                                "SESSION_STRING address %r is not a Telegram "
+                                "DC (VPN/proxy artifact?) — dialing canonical "
+                                "DC%s %s:%s instead (the auth key is "
+                                "DC-bound, so this is safe)",
+                                old_addr, dc_id, canonical, port)
+                        except Exception:
+                            logger.debug("canonical DC override failed",
+                                         exc_info=True)
                 self.session_info["address_kind"] = kind
                 if kind == "private":
-                    # A private/loopback address embedded in the string means it
-                    # was generated behind a VPN, an MTProto proxy, or a broken
-                    # generator. It can NEVER connect from a public host — fail
-                    # fast with instructions instead of timing out for 60 s
-                    # on every retry forever.
+                    # No canonical DC to fall back to either — a private
+                    # address with an unknown DC can never connect from a
+                    # public host. Fail fast with instructions instead of
+                    # burning a 60 s timeout on every retry forever.
                     self._init_error = (
                         f"SESSION_STRING embeds a private address "
-                        f"({self.session_info.get('server')}) — it was generated "
-                        "behind a VPN/proxy. Regenerate WITHOUT the proxy: "
+                        f"({self.session_info.get('server')}) and no known DC "
+                        "to fall back to — it was generated behind a "
+                        "VPN/proxy. Regenerate WITHOUT the proxy: "
                         "python login.py --string (same API_ID/API_HASH)")
                     logger.error("%s", self._init_error)
                     session_obj = StringSession()
-                elif kind == "public":
-                    logger.warning(
-                        "SESSION_STRING points at %s, which is NOT a known "
-                        "Telegram DC IP — if connects keep timing out, regenerate "
-                        "the string with: python login.py --string",
-                        self.session_info.get("server"))
             self.client = TelegramClient(
                 session_obj, api_id, api_hash,
                 # The background loop in bot.py owns the retry policy (backoff
