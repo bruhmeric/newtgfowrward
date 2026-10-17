@@ -9,6 +9,8 @@ import unicodedata
 from telegram import Update
 from telegram.ext import ContextTypes, CommandHandler
 
+from progress import ProgressReporter
+
 logger = logging.getLogger(__name__)
 
 
@@ -115,6 +117,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/scrape <url> [flags]  — 🤖 AUTO: scrape ALL media from a channel\n"
         "/scrape <post_link> old|new [N]  — 🎯 scrape from that post,\n"
         "     back in history (old) or toward the newest posts (new), N msgs\n"
+        "/dest           — 📌 view / change the DEFAULT destination\n"
+        "     `/dest saved on` — Saved Messages is the default (even if a\n"
+        "       group is set) · `/dest saved off` — back to the group\n"
         "/stop_scrape    — 🛑 stop the active scrape\n"
         "/scrape_status  — 📊 check scrape progress\n"
         "/caption <text>  — 📝 set a custom caption (replaces original)\n"
@@ -148,9 +153,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  Applies to link forwards, /saved and all scraping. A post that is "
         "just a link is skipped entirely when link stripping is on.\n"
         "\n*Destination types*\n"
+        "• No destination set? Everything goes to your Saved Messages —\n"
+        "  the bot works out of the box, before any /setgroup\n"
+        "• `/dest saved on` — make Saved Messages the default permanently\n"
         "• Forum groups: pick a topic from the picker\n"
         "• Regular groups/channels: single Forward button (no topic picker)\n"
-        "• Saved Messages: use /saved or /scrape saved",
+        "• Saved Messages: /saved, the `saved` flag, or the automatic fallback",
         parse_mode="Markdown",
     )
 
@@ -369,6 +377,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         v = await db.get_runtime("destination_group_id")
         group_id = v if v else None
 
+    from handlers.destination import (
+        get_saved_default, set_saved_default, resolve_destination)
+    saved_default = await get_saved_default(context)
+    eff_spec = await resolve_destination(context)
+
     topics_count = 0
     if group_id is not None:
         topics_count = len(await context.bot_data["topics"].get_topics(int(group_id)))
@@ -397,7 +410,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"• Uptime: {uptime} (resets on every Render restart)\n"
         f"• Memory (RSS): {rss} / 512 MB free-tier limit\n"
         f"• Telethon user session: {telethon_status}\n"
+        f"• Saved Messages default: {'ON' if saved_default else 'off'}\n"
         f"• Destination group: {group_id or '(not set)'}\n"
+        f"• Effective destination: {eff_spec.label}\n"
         f"• Known topics: {topics_count}\n"
         f"• Admin whitelist: {len(cfg.admin_ids)} user(s)\n"
         f"• Keep-alive: {'on' if cfg.keep_alive else 'off'}"
@@ -641,35 +656,15 @@ async def cmd_saved(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="Markdown",
     )
 
-    # Build a progress callback that updates the status message
-    import time as _time
-    last_update = {"time": 0.0, "text": "", "first": True}
+    # Build a progress callback that updates the status message.
+    # Rich format (bar + MB/s), throttled edits with the first one immediate.
+    reporter = ProgressReporter(
+        lambda text: status_msg.edit_text(text), min_interval=0.8)
 
     async def progress_cb(sent_bytes: int, total_bytes: int, label: str):
-        now = _time.time()
-        if total_bytes > 0:
-            pct = (sent_bytes / total_bytes) * 100
-            sent_mb = sent_bytes / (1024 * 1024)
-            total_mb = total_bytes / (1024 * 1024)
-            text = (f"📡 {label}\n\n"
-                    f"Progress: {pct:.1f}%\n"
-                    f"{sent_mb:.2f} / {total_mb:.2f} MB")
-        else:
-            text = f"📡 {label}..."
-
-        if text == last_update["text"]:
-            return
-
-        if not last_update["first"]:
-            if now - last_update["time"] < 0.5:
-                return
-        last_update["first"] = False
-        last_update["time"] = now
-        last_update["text"] = text
-        try:
-            await status_msg.edit_text(text)
-        except Exception:
-            pass
+        # label arrives as "Downloading photo_2.jpg" / "Uploading video.mp4"
+        await reporter.bytes_progress(
+            label=label, sent_bytes=sent_bytes, total_bytes=total_bytes)
 
     try:
         # Send to "me" — Telethon's special entity for Saved Messages.
@@ -791,6 +786,7 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     url = context.args[0]
     raw_flags = [a.lower() for a in context.args[1:]]
     send_to_saved = "saved" in raw_flags
+    send_to_group = "group" in raw_flags
     oldest_first = "old" in raw_flags or "oldest" in raw_flags
 
     # Parse media type filters
@@ -851,7 +847,9 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await run_scrape_from_point(
             update, context, parsed_post, direction, point_count or 50,
             media_types=media_types, parallel=parallel,
-            send_to_saved=send_to_saved)
+            send_to_saved=send_to_saved,
+            prefer=("saved" if send_to_saved else
+                    "group" if send_to_group else None))
         return
     if parsed_post and point_count is not None and not direction:
         await update.effective_message.reply_text(
@@ -884,24 +882,20 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    # Determine destination
-    if send_to_saved:
-        dest_chat_id = "me"
-        dest_label = "Saved Messages"
-    else:
-        db = context.bot_data["db"]
-        dest_chat_id = cfg.destination_group_id
-        if dest_chat_id is None:
-            v = await db.get_runtime("destination_group_id")
-            dest_chat_id = int(v) if v else None
-        if dest_chat_id is None:
-            await update.effective_message.reply_text(
-                "No destination group set. Either:\n"
-                "  • /setgroup <group_id> first, OR\n"
-                "  • Use /scrape <url> saved — to send to Saved Messages"
-            )
-            return
-        dest_label = f"chat {dest_chat_id}"
+    # Determine destination (explicit flags > /dest toggle > group > Saved fallback)
+    from handlers.destination import resolve_destination
+    prefer = "saved" if send_to_saved else ("group" if send_to_group else None)
+    spec = await resolve_destination(context, prefer=prefer)
+    if spec is None:
+        # Only reachable with an explicit `group` flag and no group configured
+        await update.effective_message.reply_text(
+            "No destination group set — nothing to send to. Either:\n"
+            "  • /setgroup <group_id> first, OR\n"
+            "  • drop the `group` flag (or use `saved`) to send to Saved Messages"
+        )
+        return
+    dest_chat_id = spec.dest_id
+    dest_label = spec.label
 
     # Build the filter description for the status message
     filter_desc = "ALL media"
@@ -917,7 +911,7 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     status_msg = await update.effective_message.reply_text(
         f"🔍 Starting scrape...\n\n"
         f"Source: `{parsed.chat_ref}`\n"
-        f"Destination: {dest_label}\n"
+        f"{spec.dest_line}\n"
         f"Order: {'oldest first' if oldest_first else 'newest first'}\n"
         f"Filter: {filter_desc}\n"
         f"Parallel: {parallel} sends{resume_desc}\n\n"
@@ -1169,6 +1163,102 @@ async def cmd_strip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Default destination (/dest)
+# ---------------------------------------------------------------------------
+
+async def cmd_dest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """View or change the DEFAULT destination.
+
+    Usage:
+      /dest               — show the current settings
+      /dest saved on      — Saved Messages becomes the default destination
+                            (forwards/scrapes go there even if a group is set)
+      /dest saved off     — back to the group as default (when one is set)
+      /dest group         — same as /dest saved off
+
+    With NO destination group set, everything falls back to Saved Messages
+    automatically — the toggle only matters once a group IS set.
+    Persisted in the DB, so it survives restarts (and Render redeploys).
+    """
+    cfg = context.bot_data["config"]
+    db = context.bot_data["db"]
+    if not cfg.is_admin(update.effective_user.id):
+        logger.warning("/dest DENIED — user_id=%s not in ADMIN_IDS=%s",
+                       update.effective_user.id, cfg.admin_ids)
+        return
+
+    from handlers.destination import (
+        get_saved_default, set_saved_default, resolve_destination)
+    args = [a.lower() for a in (context.args or [])]
+
+    async def _group_id() -> int | None:
+        gid = cfg.destination_group_id
+        if gid is None:
+            v = await db.get_runtime("destination_group_id")
+            gid = int(v) if v else None
+        return gid
+
+    if not args:
+        cur = await get_saved_default(context)
+        spec = await resolve_destination(context)
+        gid = await _group_id()
+        note = ""
+        if not gid:
+            note = ("\nℹ️ With no group set, everything goes to Saved Messages "
+                    "automatically.")
+        elif cur:
+            note = ("\nℹ️ A group is set but is NOT used — the toggle has "
+                    "priority. `/dest saved off` to send to the group.")
+        await update.effective_message.reply_text(
+            f"📌 Default destination\n\n"
+            f"• Saved Messages as default: {'✅ ON' if cur else '⚪ off'}\n"
+            f"• Destination group: {gid or '(not set)'}\n"
+            f"• Effective destination: {spec.label}{note}\n\n"
+            f"Usage:\n"
+            f"  `/dest saved on` — Saved Messages is the default\n"
+            f"  `/dest saved off` / `/dest group` — use the group\n\n"
+            f"Per-run override on /scrape: the `saved` / `group` flags.",
+            parse_mode="Markdown",
+        )
+        return
+
+    a0 = args[0]
+    if a0 in ("saved", "me", "self"):
+        val = args[1] if len(args) > 1 else None
+        if val not in ("on", "off", "true", "false", "1", "0", "yes", "no"):
+            await update.effective_message.reply_text(
+                "Usage: `/dest saved on` or `/dest saved off`",
+                parse_mode="Markdown")
+            return
+        on = val in ("on", "true", "1", "yes")
+        await set_saved_default(context, on)
+    elif a0 in ("group", "chat"):
+        on = False
+        await set_saved_default(context, on)
+    else:
+        await update.effective_message.reply_text(
+            "Unknown option. Use `/dest` to see status, `/dest saved on|off`, "
+            "or `/dest group`.", parse_mode="Markdown")
+        return
+
+    spec = await resolve_destination(context)
+    if on:
+        await update.effective_message.reply_text(
+            "✅ Saved Messages is now the DEFAULT destination.\n"
+            "Links, direct sends and /scrape all go there; use the `group` "
+            "flag on /scrape to override per-run.")
+    else:
+        gid = await _group_id()
+        if gid:
+            await update.effective_message.reply_text(
+                f"✅ Default destination: {spec.label}.")
+        else:
+            await update.effective_message.reply_text(
+                "✅ Default destination: Saved Messages (fallback — no group "
+                "is set yet, so nothing changes until you /setgroup).")
+
+
+# ---------------------------------------------------------------------------
 # From-point scraping (post link + old/new direction)
 # ---------------------------------------------------------------------------
 
@@ -1181,6 +1271,7 @@ async def run_scrape_from_point(
     media_types: list[str] | None = None,
     parallel: int = 3,
     send_to_saved: bool = False,
+    prefer: str | None = None,
 ) -> None:
     """Start a from-point scrape as a background task. Shared by:
       * /scrape <post_link> old|new [count] [flags]
@@ -1188,6 +1279,8 @@ async def run_scrape_from_point(
 
     Performs the admin/session/destination checks and wires the status
     callbacks + bot_data state that /stop_scrape and /scrape_status read.
+    `prefer` mirrors the /scrape flags ("saved"/"group") for destination
+    resolution; None = automatic (toggle > group > Saved fallback).
     """
     import asyncio
     cfg = context.bot_data["config"]
@@ -1213,24 +1306,19 @@ async def run_scrape_from_point(
     count = max(1, min(int(count or 50), 500))
     parallel = max(1, min(int(parallel or 3), 10))
 
-    # Destination: Saved Messages or the configured group
-    if send_to_saved:
-        dest_chat_id = "me"
-        dest_label = "Saved Messages"
-    else:
-        db = context.bot_data["db"]
-        dest_chat_id = cfg.destination_group_id
-        if dest_chat_id is None:
-            v = await db.get_runtime("destination_group_id")
-            dest_chat_id = int(v) if v else None
-        if dest_chat_id is None:
-            await update.effective_message.reply_text(
-                "No destination group set. Either:\n"
-                "  • /setgroup <group_id> first, OR\n"
-                "  • add the `saved` flag to send to Saved Messages"
-            )
-            return
-        dest_label = f"chat {dest_chat_id}"
+    # Destination: explicit flags > /dest toggle > group > Saved fallback
+    from handlers.destination import resolve_destination
+    spec = await resolve_destination(context, prefer=prefer)
+    if spec is None:
+        # Only reachable with an explicit `group` request and no group set
+        await update.effective_message.reply_text(
+            "No destination group set — nothing to send to. Either:\n"
+            "  • /setgroup <group_id> first, OR\n"
+            "  • drop the `group` flag (or use `saved`) to send to Saved Messages"
+        )
+        return
+    dest_chat_id = spec.dest_id
+    dest_label = spec.label
 
     arrow = "⬅ back in history" if direction == "old" else "➡ toward the newest posts"
     filter_desc = "everything (incl. text posts)" if not media_types \
@@ -1240,7 +1328,7 @@ async def run_scrape_from_point(
         f"Source: `{parsed.chat_ref}` (post #{parsed.message_id})\n"
         f"Direction: {direction} ({arrow})\n"
         f"Count: up to {count} message(s)\n"
-        f"Destination: {dest_label}\n"
+        f"{spec.dest_line}\n"
         f"Filter: {filter_desc}\n\n"
         f"_Use /stop_scrape to cancel._",
         parse_mode="Markdown",
@@ -1259,6 +1347,7 @@ async def run_scrape_from_point(
         "parallel": parallel,
         "anchor_id": parsed.message_id,
         "direction": direction,
+        "expected_total": 0,
     }
     try:
         import bot as _bot
@@ -1289,6 +1378,7 @@ async def run_scrape_from_point(
             "last_message_id": result_dict.get("last_message_id", 0),
             "flood_waits": result_dict.get("flood_waits", 0),
             "cancelled": result_dict.get("cancelled", False),
+            "expected_total": result_dict.get("expected_total") or 0,
             "last_update": time.time(),
         })
         try:
@@ -1447,6 +1537,22 @@ async def cmd_scrape_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     running = task and not task.done()
     elapsed = time.time() - status.get("started_at", 0) if status.get("started_at") else 0
     state_str = "🟢 running" if running else "🔴 finished"
+
+    sent = int(status.get("sent_count", 0) or 0)
+    expected = int(status.get("expected_total", 0) or 0)
+    rate = (sent / elapsed) if elapsed > 1 and sent > 0 else None
+
+    if expected:
+        pct = (sent / expected * 100) if expected else 0.0
+        remaining = max(expected - sent, 0)
+        eta_str = (f"~{int(remaining / rate)}s" if rate and rate > 0 else "?")
+        rate_str = f"{rate:.1f} msg/s" if rate else "n/a"
+        progress_str = (f"Progress: {sent}/{expected} ({pct:.0f}%)\n"
+                        f"Rate: {rate_str} · ETA: {eta_str}\n")
+    else:
+        rate_str = f"{rate:.1f} msg/s" if rate else "n/a"
+        progress_str = f"Rate: {rate_str}\n"
+
     await update.effective_message.reply_text(
         f"📊 Scrape status: {state_str}\n\n"
         f"Source: `{status.get('source_ref', '?')}`\n"
@@ -1455,8 +1561,9 @@ async def cmd_scrape_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"Filter: {status.get('filter', 'ALL media')}\n"
         f"Parallel: {status.get('parallel', 3)}\n"
         f"Elapsed: {elapsed:.0f} sec\n\n"
+        f"{progress_str}"
         f"Total seen: {status.get('total_seen', 0)}\n"
-        f"Sent: {status.get('sent_count', 0)}\n"
+        f"Sent: {sent}\n"
         f"Failed: {status.get('failed_count', 0)}\n"
         f"Skipped (filtered/no media): {status.get('skipped_count', 0)}\n"
         f"Flood waits: {status.get('flood_waits', 0)}\n"
@@ -1508,6 +1615,7 @@ def register_admin_handlers(app) -> None:
     app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CommandHandler("test_link", cmd_test_link))
     app.add_handler(CommandHandler("saved", cmd_saved))
+    app.add_handler(CommandHandler("dest", cmd_dest))
     app.add_handler(CommandHandler("scrape", cmd_scrape))
     app.add_handler(CommandHandler("stop_scrape", cmd_stop_scrape))
     app.add_handler(CommandHandler("scrape_status", cmd_scrape_status))

@@ -53,6 +53,7 @@ os.environ.update({
     "LOG_LEVEL": "INFO",
     "STRIP_CAPTIONS": "",          # /strip env defaults (neutralized here)
     "STRIP_LINKS": "",
+    "SAVED_MESSAGES_DEFAULT": "",   # /dest env default (neutralized here)
 })
 
 print("== 1. Module imports (catches the Telethon GetForumTopicsRequest bug) ==")
@@ -60,9 +61,11 @@ import config as config_mod          # noqa: E402
 import db as db_mod                  # noqa: E402
 import topics as topics_mod          # noqa: E402
 import user_session as us_mod        # noqa: E402
+import progress as progress_mod      # noqa: E402
 import handlers.admin                # noqa: E402
 import handlers.direct               # noqa: E402
 import handlers.link                 # noqa: E402
+import handlers.destination          # noqa: E402
 import bot as bot_mod                # noqa: E402
 check("all modules import cleanly", True)
 
@@ -644,6 +647,212 @@ lines = bot_mod._health_runtime_lines(_state_on)
 check("health endpoint lines carry strip + scrape state",
       "strip_captions: on" in lines and "strip_links: off" in lines
       and "scrape: running" in lines, f"got {lines!r}")
+
+print()
+print("== 17. Destination resolver + Saved Messages toggle ==")
+
+
+async def dest_resolver_tests() -> None:
+    import handlers.destination as hdest
+
+    class Ctx:
+        def __init__(self, cfg_obj, db_obj, cache=None):
+            self.bot_data = {"config": cfg_obj, "db": db_obj}
+            if cache is not None:
+                self.bot_data["saved_default"] = cache
+
+    def make_cfg(group_id):
+        return type("C", (), {"destination_group_id": group_id})()
+
+    with tempfile.TemporaryDirectory() as td:
+        d = db_mod.Database(os.path.join(td, "t17.db"))
+        await d.init()
+        ctx = Ctx(make_cfg(None), d)
+
+        # 1. auto, toggle off, no group -> Saved fallback (with a note)
+        spec = await hdest.resolve_destination(ctx)
+        check("no group + toggle off -> Saved Messages fallback",
+              spec is not None and spec.is_saved and spec.dest_id == "me"
+              and bool(spec.note), f"got {spec}")
+        check("dest_line renders Destination + note",
+              spec.dest_line.startswith("Destination: Saved Messages")
+              and "ℹ️" in spec.dest_line)
+
+        # 2. toggle on -> saved is the default; persists in the DB
+        await hdest.set_saved_default(ctx, True)
+        spec = await hdest.resolve_destination(ctx)
+        check("toggle on -> Saved Messages is the default",
+              spec.is_saved and spec.dest_id == "me")
+        ctx_fresh = Ctx(make_cfg(None), d)   # no in-memory cache
+        check("toggle persists in the DB (fresh context reads it)",
+              await hdest.get_saved_default(ctx_fresh) is True)
+
+        # 3. toggle on + group set -> STILL Saved Messages (toggle wins)
+        ctx_grp = Ctx(make_cfg(-100123), d)
+        spec = await hdest.resolve_destination(ctx_grp)
+        check("toggle on + group set -> toggle wins (Saved Messages)",
+              spec.is_saved)
+
+        # 4. toggle off + group set -> the group
+        await hdest.set_saved_default(ctx, False)
+        spec = await hdest.resolve_destination(ctx_grp)
+        check("toggle off + group set -> group destination",
+              not spec.is_saved and spec.dest_id == -100123)
+
+        # 5. group restored from DB when the cfg attr is empty (/setgroup flow)
+        await d.set_runtime("destination_group_id", "-100777")
+        spec = await hdest.resolve_destination(Ctx(make_cfg(None), d))
+        check("group restored from DB when env attr empty",
+              not spec.is_saved and spec.dest_id == -100777)
+
+        # 6/7. explicit per-run overrides
+        ctx777 = Ctx(make_cfg(None), d)
+        spec = await hdest.resolve_destination(ctx777, prefer="saved")
+        check("prefer=saved forces Saved Messages", spec.is_saved)
+        spec = await hdest.resolve_destination(ctx777, prefer="group")
+        check("prefer=group forces the group",
+              not spec.is_saved and spec.dest_id == -100777)
+
+        # 8. prefer=group with NOTHING configured -> None (caller errors)
+        d2 = db_mod.Database(os.path.join(td, "t17b.db"))
+        await d2.init()
+        spec = await hdest.resolve_destination(Ctx(make_cfg(None), d2),
+                                               prefer="group")
+        check("prefer=group with nothing set -> None",
+              spec is None)
+        # ...but the AUTO path on the same empty setup never fails:
+        spec = await hdest.resolve_destination(Ctx(make_cfg(None), d2))
+        check("auto path with nothing set -> Saved fallback (never None)",
+              spec is not None and spec.is_saved)
+
+        # 9. env seed: SAVED_MESSAGES_DEFAULT=true with an empty DB
+        try:
+            os.environ["SAVED_MESSAGES_DEFAULT"] = "true"
+            check("SAVED_MESSAGES_DEFAULT env seeds the toggle",
+                  await hdest.get_saved_default(Ctx(make_cfg(None), d2)) is True)
+        finally:
+            os.environ["SAVED_MESSAGES_DEFAULT"] = ""
+
+        # 10. in-memory cache beats the DB (set by /dest this boot)
+        ctx_cache = Ctx(make_cfg(None), d)
+        ctx_cache.bot_data["saved_default"] = False   # DB says False too here
+        check("bot_data cache path works",
+              await hdest.get_saved_default(ctx_cache) is False)
+        await d2.close()
+        await d.close()
+
+
+asyncio.run(dest_resolver_tests())
+
+print()
+print("== 18. Progress rendering + throttled reporter ==")
+
+check("bar 0% is empty", progress_mod.render_bar(0) == "░" * 20)
+check("bar 50% is half filled",
+      progress_mod.render_bar(0.5) == "█" * 10 + "░" * 10)
+check("bar 100% is full", progress_mod.render_bar(1.0) == "█" * 20)
+check("bar clamps overshoot (parallel sends racing)",
+      progress_mod.render_bar(1.7) == "█" * 20)
+
+known = progress_mod.format_scrape_progress(
+    title="from #42 old", sent=25, total=50, failed=1, skipped=2,
+    flood_waits=0, rate=1.5, last_msg_id=4213)
+check("known-total progress: bar + % + ETA + rate + last id",
+      "50%" in known and "ETA" in known and "1.5 msg/s" in known
+      and "25/50 sent" in known and "1 failed" in known and "2 skipped" in known
+      and "#4213" in known, known)
+
+unknown = progress_mod.format_scrape_progress(
+    title="somechannel", sent=12, total=None, failed=0, skipped=3, rate=2.0)
+check("unknown-total progress: counts + rate, NO fake %",
+      "12 sent" in unknown and "0 failed" in unknown and "3 skipped" in unknown
+      and "2.0 msg/s" in unknown and "%" not in unknown, unknown)
+
+bytes_txt = progress_mod.format_bytes_progress(
+    label="Downloading video_3.mp4",
+    sent_bytes=int(26.5 * 1024 * 1024), total_bytes=int(41.2 * 1024 * 1024),
+    rate=3.1)
+check("bytes progress: bar + MB + MB/s",
+      "Downloading video_3.mp4" in bytes_txt and "64%" in bytes_txt
+      and "26.5 / 41.2 MB" in bytes_txt and "3.1 MB/s" in bytes_txt,
+      bytes_txt)
+
+
+async def reporter_tests() -> None:
+    sent_texts = []
+
+    async def edit(text):
+        sent_texts.append(text)
+        return True
+
+    r = progress_mod.ProgressReporter(edit, min_interval=0.3)
+    ok1 = await r.update("first")            # first is always sent
+    ok2 = await r.update("second")           # inside the interval -> blocked
+    await asyncio.sleep(0.35)
+    ok3 = await r.update("second")           # after the interval -> sent
+    ok4 = await r.update("second")           # identical text -> deduped
+    check("reporter: immediate first, throttled after, dedup identical",
+          ok1 and (ok2 is False) and ok3 and (ok4 is False)
+          and sent_texts == ["first", "second"], str(sent_texts))
+
+    # bytes_progress tracks MB/s between samples
+    texts2 = []
+
+    async def edit2(text):
+        texts2.append(text)
+        return True
+
+    r2 = progress_mod.ProgressReporter(edit2, min_interval=0.05)
+    await r2.bytes_progress(label="Uploading video.mp4",
+                            sent_bytes=0, total_bytes=10 * 1024 * 1024)
+    await asyncio.sleep(0.12)
+    await r2.bytes_progress(label="Uploading video.mp4",
+                            sent_bytes=1 * 1024 * 1024,
+                            total_bytes=10 * 1024 * 1024)
+    check("bytes_progress renders bar + MB/s from deltas",
+          len(texts2) == 2 and "MB/s" in texts2[1] and "10%" in texts2[1],
+          str(texts2))
+
+
+asyncio.run(reporter_tests())
+
+print()
+print("== 19. Dashboard + /health surface the destination state ==")
+_old_group = pcfg.destination_group_id
+pcfg.destination_group_id = -1004372538320
+try:
+    _st = {
+        "ready": True, "bot_username": "testbot", "attempts": 1,
+        "webhook_registered": False, "user_session": "connected as @x (1)",
+        "phase": "running", "error": None, "hint": None,
+        "wh_info": None, "wh_info_ts": 0.0,
+        "strip": {"captions": False, "links": False},
+        "scrape": "running — chan #500 new (sent 12/50)",
+        "dest": {"saved_default": True, "group_id": -1004372538320},
+    }
+    html_on = bot_mod._render_dashboard(pcfg, _st)
+    check("dashboard: toggle ON -> Saved Messages default + unused group note",
+          "Saved Messages (default ON)" in html_on and "set but unused" in html_on)
+
+    _st["dest"] = {"saved_default": False, "group_id": None}
+    pcfg.destination_group_id = None
+    html_fb = bot_mod._render_dashboard(pcfg, _st)
+    check("dashboard: no group -> Saved Messages fallback card",
+          "automatic fallback" in html_fb)
+
+    lines_d = bot_mod._health_runtime_lines(_st)
+    check("health lines carry saved_default + destination",
+          "saved_default: off" in lines_d
+          and "destination: Saved Messages (fallback" in lines_d
+          and "scrape: running" in lines_d, lines_d)
+
+    _st["dest"] = {"saved_default": True, "group_id": -1004372538320}
+    lines_on = bot_mod._health_runtime_lines(_st)
+    check("health lines: toggle on -> destination default on",
+          "saved_default: on" in lines_on
+          and "destination: Saved Messages (default on)" in lines_on, lines_on)
+finally:
+    pcfg.destination_group_id = _old_group
 
 print()
 print(f"RESULT: {PASS} passed, {FAIL} failed")

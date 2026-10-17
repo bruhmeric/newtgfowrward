@@ -3,8 +3,89 @@
 This release fixes several real bugs, hardens the webhook server, and tunes
 the bot specifically for Render's free tier (512 MB RAM / 0.1 CPU / 15-min
 sleep / ephemeral disk). All changes are covered by `smoke_test.py`
-(95 checks) and `webhook_e2e_test.py` (28 checks) — run both locally with
+(121 checks) and `webhook_e2e_test.py` (28 checks) — run both locally with
 `pip install -r requirements.txt` first.
+
+---
+
+## Feature release 2: Saved Messages destination + live progress
+
+### 1. Forward to Saved Messages when no destination is set
+
+Previously every forward path hard-failed with "No destination group set.
+Use /setgroup" when `DESTINATION_GROUP_ID` / `/setgroup` was missing. Now
+the destination is resolved by a single resolver (new
+`handlers/destination.py`) used by every path:
+
+1. an explicit per-run flag (`/scrape <url> saved` or the new
+   `/scrape <url> group`)
+2. the `/dest saved on` toggle (see below)
+3. the configured group (env or `/setgroup`; DB value wins)
+4. **fallback: the user's Saved Messages** — the bot works out of the box
+
+- Sending a link, or any media, now **skips the picker entirely** and goes
+  straight to Saved Messages (new `send_batch_to_saved` in
+  `handlers/direct.py`) when the effective destination is Saved — no button
+  tap needed.
+- Saved Messages is only reachable through the Telethon user session (the
+  Bot API cannot send to a user's self-chat), so that route needs a live
+  `SESSION_STRING`; the error message when the session is down explains
+  both ways out (fresh session vs `/setgroup` group path).
+- Pending-forward taps (topic buttons) reroute through Saved Messages the
+  same way when the group has been unset while a picker was in flight.
+
+### 2. `/dest` — make Saved Messages the default (persistent toggle)
+
+```
+/dest                  # show settings + effective destination
+/dest saved on         # Saved Messages is the default — even with a group set
+/dest saved off        # back to the group (alias: /dest group)
+```
+
+- Persisted in the DB (`saved_messages_default`), survives restarts and
+  Render redeploys; `SAVED_MESSAGES_DEFAULT=true` env seeds the same thing
+  on first boot.
+- `/scrape` gains the `group` flag to override the toggle per-run (the
+  `saved` flag already existed).
+- `/status` shows "Saved Messages default" + "Effective destination"; the
+  web dashboard gains an **Effective destination** card and `/health` gains
+  `saved_default:` / `destination:` lines.
+
+### 3. Live progress, rebuilt
+
+New `progress.py` (pure formatters + a throttled `ProgressReporter`):
+
+- **from-point scrapes know their count up front** → real progress bar
+  (`████████░░░░░░░░ 50%`), percentage, `sent/total`, msg/s rate and ETA.
+- Whole-channel runs don't know their total — they now show counts +
+  msg/s instead of a fabricated percentage.
+- Byte-level (download/upload) progress gains a bar + **MB/s** (computed
+  from deltas between samples) instead of a bare "Progress: 61.2%".
+- Edits are throttled per reporter (first update immediate, then ≥0.8s for
+  byte progress / ≥5s for scrape status), deduped, and never fail the
+  forward they're reporting on.
+- `/scrape_status` now computes progress %, rate and ETA from the live
+  stats (from-point runs report `expected_total` through the stats
+  callback); the final from-point summary shows "Sent X/Y" + "Took 34s ·
+  1.5 msg/s".
+
+### Files changed
+
+- new: `handlers/destination.py` (resolver + toggle), `progress.py`
+- `handlers/admin.py`: `/dest` command, resolver wired into `/scrape` +
+  from-point, richer `/scrape_status` + `/status` + `/help`, `/saved`
+  progress via the reporter, `expected_total` in scrape stats
+- `handlers/direct.py`: `send_batch_to_saved`, saved fast path for the
+  batched direct-send flow and the pending-forward tap, picker error text
+- `handlers/link.py`: saved fast path (skip picker)
+- `user_session.py`: rich status texts in both scrape engines,
+  `expected_total` for from-point, elapsed + msg/s in the final summary
+- `bot.py`: Effective-destination card, `saved_default:`/`destination:`
+  health lines, `/dest` toggle restored from DB in post_init
+- `.env.example`: `SAVED_MESSAGES_DEFAULT` documented
+- tests: `smoke_test.py` 95 → **121 checks** (sections 17–19: resolver
+  matrix, toggle persistence, env seed, bar/ETA/MB-s rendering, reporter
+  throttle + dedup, dashboard/health); `webhook_e2e_test.py` still 28/28
 
 ---
 

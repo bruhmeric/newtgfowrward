@@ -48,6 +48,7 @@ import asyncio
 import hashlib
 import html as _html
 import logging
+import os
 import signal
 import sys
 import time
@@ -125,6 +126,9 @@ _STATE: dict[str, Any] = {
     # the /strip command and the scrape runners (see _sync_strip_state).
     "strip": {"captions": False, "links": False},
     "scrape": None,     # None/"idle" or "running — <source> #<id> <dir> (sent N)"
+    # /dest toggle (Saved Messages as default) — seeded by post_init,
+    # updated by the /dest command (handlers.destination.set_saved_default).
+    "dest": {"saved_default": False, "group_id": None},
 }
 
 # Owns the Telethon user-session background lifecycle. The user session is
@@ -151,13 +155,28 @@ def _scrub(cfg: Config, text: Any) -> str:
 
 def _health_runtime_lines(state: dict) -> str:
     """Feature-state lines shared by the webhook and polling /health
-    handlers: the /strip toggles and scrape activity."""
+    handlers: the /strip toggles, the /dest toggle and scrape activity."""
     strip = state.get("strip") or {}
-    return (
+    lines = (
         f"strip_captions: {'on' if strip.get('captions') else 'off'}\n"
         f"strip_links: {'on' if strip.get('links') else 'off'}\n"
-        f"scrape: {state.get('scrape') or 'idle'}\n"
     )
+    dest = state.get("dest") or {}
+    if dest:
+        gid = dest.get("group_id")
+        on = bool(dest.get("saved_default"))
+        if on:
+            eff = "Saved Messages (default on)"
+        elif gid:
+            eff = str(gid)
+        else:
+            eff = "Saved Messages (fallback — no group set)"
+        lines += (
+            f"saved_default: {'on' if on else 'off'}\n"
+            f"destination: {eff}\n"
+        )
+    lines += f"scrape: {state.get('scrape') or 'idle'}\n"
+    return lines
 
 
 def _startup_hint(exc: BaseException) -> str:
@@ -294,6 +313,25 @@ def _render_dashboard(cfg: Config, state: dict) -> str:
         "Destination group",
         esc(str(cfg.destination_group_id)) if cfg.destination_group_id
         else "<span class='dim'>not set — use /setgroup</span>"))
+
+    # Effective destination — resolves the /dest toggle the same way the
+    # forward paths do (toggle on > group > Saved Messages fallback), so the
+    # card always matches what the bot actually delivers to.
+    dest_state = state.get("dest") or {}
+    saved_default = bool(dest_state.get("saved_default"))
+    if saved_default:
+        dest_val = '<span class="ok">Saved Messages (default ON)</span>'
+        if cfg.destination_group_id:
+            dest_val += (f'<div class="dim" style="margin-top:4px;font-size:11px;">'
+                         f'group {esc(str(cfg.destination_group_id))} set but unused — '
+                         f'/dest saved off to switch</div>')
+    elif cfg.destination_group_id:
+        dest_val = esc(str(cfg.destination_group_id))
+    else:
+        dest_val = ('<span class="ok">Saved Messages</span>'
+                    '<div class="dim" style="margin-top:4px;font-size:11px;">'
+                    'no group set — automatic fallback</div>')
+    cards.append(card("Effective destination", dest_val))
 
     # Forward cleaning (/strip) — ON states are worth an at-a-glance look
     # because they silently change every forward the bot makes.
@@ -525,6 +563,27 @@ async def post_init(app: Application) -> None:
         _STATE["strip"] = {"captions": strip_caps, "links": strip_lnks}
     except Exception:
         logger.debug("could not load strip settings (non-fatal)", exc_info=True)
+
+    # /dest toggle (Saved Messages as the default destination): DB value
+    # wins over the SAVED_MESSAGES_DEFAULT env default. Mirrored into
+    # _STATE["dest"] for the dashboard + /health, and cached on bot_data for
+    # handlers.destination.get_saved_default().
+    try:
+        _saved_raw = await db.get_runtime("saved_messages_default")
+        if _saved_raw is not None:
+            saved_default = _saved_raw in ("1", "true")
+        else:
+            saved_default = os.environ.get(
+                "SAVED_MESSAGES_DEFAULT", "").strip().lower() in ("1", "true", "yes", "on")
+        app.bot_data["saved_default"] = saved_default
+        _STATE["dest"] = {
+            "saved_default": saved_default,
+            "group_id": cfg.destination_group_id,
+        }
+        if saved_default:
+            logger.info("Saved Messages is the DEFAULT destination (/dest)")
+    except Exception:
+        logger.debug("could not load saved-default toggle (non-fatal)", exc_info=True)
 
     if cfg.has_user_session:
         # Telethon connects in the BACKGROUND with its own retry loop — a bad

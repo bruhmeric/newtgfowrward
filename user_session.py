@@ -39,6 +39,10 @@ except ImportError:  # pragma: no cover — very old Telethon
 
 logger = logging.getLogger(__name__)
 
+# Progress formatters (repo-root module; no project-internal imports ->
+# no circularity with handlers/* or bot.py, which all import this module).
+from progress import format_scrape_progress
+
 
 # ---------- Telegram datacenter reachability diagnostics ----------
 
@@ -2114,6 +2118,7 @@ class UserSession:
         # Statistics for status updates
         last_status_time = 0
         status_interval = 5.0  # update status every 5 seconds
+        send_started = time.time()  # for the msg/s rate in progress updates
 
         # Helper: classify a message's media type
         def _classify_media(msg) -> str | None:
@@ -2328,20 +2333,27 @@ class UserSession:
                     except Exception:
                         pass
 
-                # Periodic status update
+                # Periodic status update — rich format (bar + rate).
+                # Whole-channel runs do NOT know their total up front, so
+                # this honestly shows counts + rate instead of a fake %.
                 import time as _time
                 now = _time.time()
                 if status_callback and now - last_status_time > status_interval:
                     last_status_time = now
-                    await status_callback(
-                        f"📊 Scraping in progress...\n\n"
-                        f"Total seen: {result['total_seen']}\n"
-                        f"Sent: {result['sent_count']}\n"
-                        f"Failed: {result['failed_count']}\n"
-                        f"Skipped (filtered/no media): {result['skipped_count']}\n"
-                        f"Last msg ID: {result['last_message_id']}\n"
-                        f"Parallel sends: {parallel}"
-                    )
+                    elapsed = now - send_started
+                    rate = (result["sent_count"] / elapsed
+                            if elapsed > 0.5 and result["sent_count"] else None)
+                    await status_callback(format_scrape_progress(
+                        title=(getattr(source_entity, "title", None)
+                                or str(source_chat_ref)),
+                        sent=result["sent_count"],
+                        total=None,
+                        failed=result["failed_count"],
+                        skipped=result["skipped_count"],
+                        flood_waits=result["flood_waits"],
+                        rate=rate,
+                        last_msg_id=result["last_message_id"],
+                    ))
 
                 # Send stats to stats_callback (for bot_data updates so
                 # /scrape_status shows current progress, not stale data)
@@ -2447,6 +2459,7 @@ class UserSession:
             "flood_waits": 0,
             "anchor_id": anchor_message_id, "direction": direction,
             "fetched_count": 0, "first_sent_id": 0, "last_sent_id": 0,
+            "expected_total": 0,
         }
 
         # Normalize media filters (same rules as scrape_channel)
@@ -2522,6 +2535,12 @@ class UserSession:
 
         # Chronological delivery order + album items sorted by id
         ordered = order_messages_for_delivery(fetched, direction)
+
+        # The count is KNOWN up front for from-point runs — the progress
+        # display can show a real bar + percentage + ETA (unlike
+        # whole-channel scrapes, where the total is unknowable).
+        result["expected_total"] = len(ordered)
+        send_started = time.time()
 
         if status_callback:
             lo, hi = ordered[0].id, ordered[-1].id
@@ -2692,12 +2711,19 @@ class UserSession:
             now = _time.time()
             if status_callback and now - last_status_time > 5.0:
                 last_status_time = now
-                await status_callback(
-                    f"📊 Scraping in progress…\n\n"
-                    f"Sent: {result['sent_count']}\n"
-                    f"Failed: {result['failed_count']}\n"
-                    f"Skipped (filtered/service): {result['skipped_count']}\n"
-                    f"Last msg ID: {result['last_message_id']}")
+                elapsed = now - send_started
+                rate = (result["sent_count"] / elapsed
+                        if elapsed > 0.5 and result["sent_count"] else None)
+                await status_callback(format_scrape_progress(
+                    title=f"from #{anchor_message_id} {direction}",
+                    sent=result["sent_count"],
+                    total=result.get("expected_total"),
+                    failed=result["failed_count"],
+                    skipped=result["skipped_count"],
+                    flood_waits=result["flood_waits"],
+                    rate=rate,
+                    last_msg_id=result["last_message_id"],
+                ))
 
             if stats_callback:
                 try:
@@ -2722,14 +2748,22 @@ class UserSession:
             else:
                 ran = (f"#{result['first_sent_id']} … #{result['last_sent_id']}"
                        if result["first_sent_id"] else "(none)")
+                elapsed = max(time.time() - send_started, 0.001)
+                took = f"{elapsed:.0f}s"
+                pace = (f" · {result['sent_count'] / elapsed:.1f} msg/s"
+                        if result["sent_count"] else "")
+                expected = result.get("expected_total") or 0
+                sent_line = (f"Sent: {result['sent_count']} / {expected}"
+                             if expected else f"Sent: {result['sent_count']}")
                 await status_callback(
                     f"✅ From-point scrape complete!\n\n"
                     f"Range: {ran}\n"
                     f"Fetched: {result['fetched_count']}\n"
-                    f"Sent: {result['sent_count']}\n"
+                    f"{sent_line}\n"
                     f"Failed: {result['failed_count']}\n"
                     f"Skipped (filtered/service): {result['skipped_count']}\n"
-                    f"Flood waits: {result['flood_waits']}\n\n"
+                    f"Flood waits: {result['flood_waits']}\n"
+                    f"Took: {took}{pace}\n\n"
                     f"To continue exactly where this stopped, send the link "
                     f"of the last message with #old / #new again.")
         return result

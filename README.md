@@ -13,7 +13,8 @@ A self-hosted Telegram bot that forwards whatever you send it to a chosen topic 
 | **Auto-scrape entire channels** | `/scrape <url> [flags]` — bot iterates ALL messages and sends media in parallel |
 | **Media type filters** | `/scrape <url> photo video` — only photos and videos; `/scrape <url> docs audio` — only docs and audio |
 | **Direct to Saved Messages** | `/saved <url>` — skip the picker, fastest path |
-| **Live progress display** | Bot edits the status message during download/upload with % complete and MB transferred |
+| **Saved Messages fallback + toggle** | No destination set? Everything goes to your Saved Messages. `/dest saved on` makes it the default even after `/setgroup` |
+| **Live progress display** | Status message is edited live: progress bar, %, msg/s rate, ETA (from-point runs know their count), MB/s on downloads/uploads |
 | **Streamable video uploads** | Videos re-uploaded with `supports_streaming=True`, original thumbnail, duration, dimensions |
 | **Three-tier protected-content fallback** | true forward → send_message(file=) → download + send_file (works on noforwards channels) |
 | **Auto-discover forum topics** | `/refresh` enumerates via Telethon `GetForumTopics` |
@@ -77,7 +78,7 @@ Edit `.env`:
 | `API_ID` | From my.telegram.org |
 | `API_HASH` | From my.telegram.org |
 | `PHONE` | Your phone (used only by `login.py`) |
-| `DESTINATION_GROUP_ID` | e.g. `-1001234567890` (optional for `/saved` and `/scrape saved`) |
+| `DESTINATION_GROUP_ID` | e.g. `-1001234567890` — optional: with nothing set, forwards go to your **Saved Messages** (see `/dest`) |
 | `ADMIN_IDS` | Comma-separated Telegram user IDs (optional but recommended) |
 
 ### 3. One-time Telethon login
@@ -109,7 +110,9 @@ python bot.py
 In a private chat with the bot:
 
 ```
-/setgroup -1001234567890      # set destination (optional for /saved, /scrape saved)
+/setgroup -1001234567890      # set destination (optional — without it everything
+                              # goes to your Saved Messages automatically)
+/dest                         # see the effective destination + toggle
 /info                         # see chat info — is it a forum? title?
 /refresh                      # discover topics (forum only)
 /topics                       # confirm topics were discovered
@@ -165,6 +168,7 @@ Iterates ALL messages in the channel and sends media in parallel. See [Scraping]
 | `/whoami` | Show your Telegram user ID + admin status |
 | `/test_link <url>` | Diagnostic: test fetching a t.me link (shows step-by-step report) |
 | `/saved <url>` | 🚀 FAST: send t.me link content directly to Saved Messages |
+| `/dest` | 📌 view / change the DEFAULT destination (`/dest saved on\|off`) |
 | `/scrape <url> [flags]` | 🤖 AUTO: scrape ALL media from a channel |
 | `/scrape <post_link> old\|new [N]` | 🎯 scrape FROM that post — back in history (`old`) or toward the newest posts (`new`) |
 | `/stop_scrape` | 🛑 stop the active scrape |
@@ -177,6 +181,34 @@ Iterates ALL messages in the channel and sends media in parallel. See [Scraping]
 
 You can also trigger a from-point scrape **without a command**: send (or forward) a post
 link with `#old` / `#new` appended — see [Scraping from a specific post](#scraping-from-a-specific-post-old--new).
+
+---
+
+## Saved Messages as the destination (/dest)
+
+The destination is resolved in this order (first match wins):
+
+1. an explicit per-run flag — `/scrape <url> saved` or `/scrape <url> group`
+2. the `/dest saved on` toggle — Saved Messages is the default destination
+3. the destination group (env `DESTINATION_GROUP_ID` or `/setgroup`)
+4. **fallback: your Saved Messages** — the bot works out of the box, before any `/setgroup`
+
+```
+/dest                  # show the current settings + effective destination
+/dest saved on         # Saved Messages becomes the default (even with a group set)
+/dest saved off        # back to the group as default (alias: /dest group)
+```
+
+- The toggle is persisted in the DB (survives restarts and Render redeploys);
+  `SAVED_MESSAGES_DEFAULT=true` in the env seeds the same thing.
+- When the effective destination is Saved Messages, sending a link (or any
+  media) skips the picker entirely and goes straight there — no button tap.
+- Saved Messages is only reachable through the Telethon user session (bots
+  have no Bot API access to your self-chat), so the `saved` route needs
+  `SESSION_STRING`. Without it, set a group with `/setgroup` — that path
+  uses the Bot API and needs no session.
+- `/status`, the web dashboard and `/health` all show the toggle + the
+  effective destination (`saved_default:` / `destination:` lines).
 
 ---
 
@@ -360,7 +392,7 @@ Differences from whole-channel scraping:
      3. Final fallback: download + re-upload with `send_file` (works for fully-protected, preserves thumbnail, streaming, duration, dimensions)
    - **Skips text-only messages** and non-downloadable types (web pages, contacts, geos, polls)
 5. **Rate limiting**: 0.3 sec delay per parallel slot + automatic FloodWait handling. Albums count as ONE send (forwarded as a grouped album)
-6. **Status updates**: edits the status message every 5 sec with progress (sent/failed/skipped counts)
+6. **Status updates**: the status message is edited live (every ~5s, throttled) — progress bar, % and ETA for from-point runs (their count is known), sent/failed/skipped counts + msg/s rate for whole-channel runs, and MB/s during downloads/uploads
 7. **Cancellation**: check between each message; `/stop_scrape` stops cleanly (waits for in-flight sends)
 8. **Efficient sending**: the scraper reuses the message objects it already fetched — no redundant `get_entity`/`get_messages` round-trips per message (3x fewer API calls, friendlier to the 0.1-CPU free instance and to Telegram's flood limits)
 
@@ -380,13 +412,19 @@ Bot: 🔍 Starting scrape...
 
 [5 sec later]
 Bot: [edits same message]
-     📊 Scraping in progress...
-     Total seen: 47
-     Sent: 23
-     Failed: 0
-     Skipped (filtered/no media): 24
-     Last msg ID: 1042
-     Parallel sends: 5
+     📤 somechannel
+     23 sent · 0 failed · 24 skipped
+     ⚡ 4.6 msg/s · last #1042
+
+[progress examples]
+     📤 from #1042 old            (from-point run — count known)
+     ██████████░░░░░░░░░░ 50%
+     25/50 sent · 1 failed · 2 skipped
+     ⚡ 1.8 msg/s · ETA ~14s · last #4213
+
+     📡 Downloading video_3.mp4  (item 3 of 7)
+     ████████████░░░░░░ 61%
+     25.3 / 41.2 MB · 3.1 MB/s
 
 You: /stop_scrape
 Bot: 🛑 Stop signal sent...
@@ -427,9 +465,14 @@ If you hit FloodWait frequently, lower the parallel count.
 /saved https://t.me/c/1234567890/42
 ```
 
-Live progress is shown during download/upload (with % complete and MB transferred). Then `✅ Sent to Saved Messages!`
+Live progress is shown during download/upload (progress bar, %, MB and MB/s). Then `✅ Sent to Saved Messages!`
 
 The same three-tier fallback applies: true forward → send_message(file=) → download + send_file.
+
+**You don't even need `/saved` anymore**: with no destination group set (or with
+`/dest saved on`), sending a link — or any media — goes to your Saved Messages
+automatically, with the same progress display. `/saved` remains the explicit,
+always-Saved path regardless of the toggle.
 
 ---
 

@@ -252,6 +252,30 @@ async def _handle_batched_message(update, context, chat_id, user_id, msg):
                 payload=kind_payload,
                 kind="direct",
             )
+
+            # Saved Messages fast path: when the effective destination is
+            # Saved Messages (the /dest toggle is on, or no group is set),
+            # skip the picker and deliver the whole batch through the user
+            # session — bots cannot reach a user's self-chat, Telethon "me"
+            # is the only route in.
+            from handlers.destination import resolve_destination
+            from handlers.direct import send_batch_to_saved
+            spec = await resolve_destination(context)
+            if spec.is_saved:
+                first_update = batch["first_update"]
+                n_items = n_media or n_text
+                status_msg = await context.bot.send_message(
+                    chat_id=first_update.effective_chat.id,
+                    text=f"📤 Sending {n_items} item"
+                         f"{'s' if n_items != 1 else ''} to Saved Messages…")
+                ok = await send_batch_to_saved(
+                    context, status_msg.edit_text, chat_id,
+                    batch["message_ids"], apply_strip=False)
+                if ok:
+                    await db.delete_pending(pending_id)
+                batches.pop(key, None)
+                return
+
             # Send a NEW message to the user with the picker
             first_update = batch["first_update"]
             await _send_picker_new(context, first_update.effective_chat.id, pending_id, label)
@@ -363,8 +387,10 @@ async def _send_picker_new(context, chat_id: int, pending_id: str, label: str) -
         v = await db.get_runtime("destination_group_id")
         group_id = int(v) if v else None
     if group_id is None:
-        await context.bot.send_message(chat_id=chat_id,
-                                       text="No destination group set. Use /setgroup <group_id>.")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="No destination group set. Use /setgroup <group_id> — or "
+                 "/dest to make Saved Messages the destination.")
         return
 
     # Check if destination is a forum
@@ -389,6 +415,85 @@ async def _send_picker_new(context, chat_id: int, pending_id: str, label: str) -
             [InlineKeyboardButton(text="Cancel", callback_data=f"cancel:{pending_id}")],
         ])
         await context.bot.send_message(chat_id=chat_id, text=label, reply_markup=keyboard)
+
+
+async def send_batch_to_saved(context, edit, source_chat_id,
+                              source_message_ids, *, apply_strip: bool = True) -> bool:
+    """Send a batch of messages to the user's Saved Messages.
+
+    This is the ONLY route into a user's self-chat: the Bot API cannot
+    deliver there, so we go through the Telethon user session as "me".
+    Used by the automatic fallback (no destination group set / /dest toggle
+    on) from the link flow, the direct-send flow, and pending-forward taps.
+
+    Args:
+      edit: async callable(text) — a Message.edit_text, CallbackQuery
+        .edit_message_text, or equivalent; progress + result are shown there.
+      apply_strip: True for sourced forwards (links — they honor /strip and
+        /caption); False for direct uploads (kept as the user sent them).
+    Returns True on success.
+    """
+    user_session = context.bot_data.get("user_session")
+    if not user_session or not user_session.available:
+        await edit(
+            "❌ Saved Messages needs the Telethon user session, which isn't "
+            "connected right now.\n\n"
+            "Two ways out:\n"
+            "  • Generate a fresh session locally (python login.py --string) "
+            "and set SESSION_STRING — the web dashboard shows the exact "
+            "reason it's failing\n"
+            "  • Or set a group with /setgroup — the bot can deliver there "
+            "without a session (that's the Bot API path)")
+        return False
+
+    n = len(source_message_ids)
+    from progress import ProgressReporter
+    reporter = ProgressReporter(edit, min_interval=0.8)
+
+    custom_caption = None
+    strip_captions = False
+    strip_links = False
+    if apply_strip:
+        from handlers.admin import _get_custom_caption, _get_strip_settings
+        custom_caption = await _get_custom_caption(context)
+        strip_captions, strip_links = await _get_strip_settings(context)
+
+    async def _pc(sent_bytes: int, total_bytes: int, label: str):
+        await reporter.bytes_progress(
+            label=label, sent_bytes=sent_bytes, total_bytes=total_bytes)
+
+    try:
+        success, diag = await user_session.send_to_destination(
+            source_chat_id=source_chat_id,
+            source_message_ids=source_message_ids,
+            dest_chat_id="me",          # Telethon: the user's own chat
+            topic_id=None,              # Saved Messages has no topics
+            progress_callback=_pc,
+            custom_caption=custom_caption,
+            strip_captions=strip_captions,
+            strip_links=strip_links,
+        )
+    except Exception as e:
+        logger.exception("send_batch_to_saved failed")
+        try:
+            await edit(f"❌ Failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return False
+
+    if success:
+        try:
+            await edit(f"✅ Sent to Saved Messages"
+                       f"{' (' + str(n) + ' message' + ('s' if n != 1 else '') + ')' if n > 1 else ''}!")
+        except Exception:
+            pass
+        return True
+    err = "\n".join(diag[-7:])
+    try:
+        await edit("❌ Could not send to Saved Messages.\n\n" + err)
+    except Exception:
+        pass
+    return False
 
 
 # ---------- callback handler (topic button tapped) ----------
@@ -437,14 +542,12 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await db.delete_pending(pending_id)
         return
 
-    # Resolve destination group id
-    group_id = cfg.destination_group_id
-    if group_id is None:
-        v = await db.get_runtime("destination_group_id")
-        if not v:
-            await q.edit_message_text("No destination group set. /setgroup <group_id>.")
-            return
-        group_id = int(v)
+    # Resolve destination. When the effective destination is Saved Messages
+    # (toggle on / no group set — e.g. a pending forward outliving a /setgroup
+    # change), route through the user session instead of the Bot API.
+    from handlers.destination import resolve_destination
+    spec = await resolve_destination(context)
+    group_id = spec.dest_id
 
     payload = pending["payload"]
     kind = pending["kind"]
@@ -483,6 +586,30 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await q.edit_message_text(f"Forwarding to {target_label}...")
 
     try:
+        if spec.is_saved:
+            # Saved Messages route (user session only — the Bot API has no
+            # access to a user's self-chat).
+            if kind == "link" and payload.get("direct_send"):
+                ids = payload["source_message_ids"]
+                src = payload["source_chat_id"]
+                use_strip = True
+            elif kind == "direct":
+                ids = payload.get("message_ids") or [src_msg_id]
+                src = src_chat_id
+                use_strip = False
+            else:
+                await q.edit_message_text(
+                    "This pending forward predates the update — send the "
+                    "content again.")
+                await db.delete_pending(pending_id)
+                return
+            from handlers.direct import send_batch_to_saved
+            ok = await send_batch_to_saved(
+                context, q.edit_message_text, src, ids, apply_strip=use_strip)
+            if ok:
+                await db.delete_pending(pending_id)
+            return
+
         if kind == "direct":
             if is_album:
                 await _forward_album(context, payload, group_id, topic_id)

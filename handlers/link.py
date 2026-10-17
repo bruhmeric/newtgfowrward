@@ -195,15 +195,26 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         kind="link",
     )
 
+    # Destination: when the effective destination is Saved Messages (the
+    # /dest toggle is on, or no group is set), skip the picker entirely and
+    # deliver straight via the Telethon user session — the Bot API has no
+    # route into a user's self-chat, "me" is the only way in.
+    from handlers.destination import resolve_destination
+    from handlers.direct import send_batch_to_saved
+    spec = await resolve_destination(context)
+    if spec.is_saved:
+        ok = await send_batch_to_saved(
+            context, status.edit_text, source_chat_id, source_message_ids,
+            apply_strip=True)
+        if ok:
+            await db.delete_pending(pending_id)
+        # on failure the record is kept (hourly purge / /cancel) and the
+        # status message already shows the exact reason.
+        return
+
     # Show topic picker (or single Forward button for non-forum)
     topics_mgr = context.bot_data["topics"]
-    group_id = cfg.destination_group_id
-    if group_id is None:
-        v = await db.get_runtime("destination_group_id")
-        group_id = int(v) if v else None
-    if group_id is None:
-        await status.edit_text("No destination group set. Use /setgroup <group_id>.")
-        return
+    group_id = spec.dest_id
 
     # Build the label showing what was fetched
     n = len(source_message_ids)
