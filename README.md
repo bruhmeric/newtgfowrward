@@ -169,8 +169,8 @@ Iterates ALL messages in the channel and sends media in parallel. See [Scraping]
 | `/test_link <url>` | Diagnostic: test fetching a t.me link (shows step-by-step report) |
 | `/saved <url>` | 🚀 FAST: send t.me link content directly to Saved Messages |
 | `/dest` | 📌 view / change the DEFAULT destination (`/dest saved on\|off`) |
-| `/scrape <url> [flags]` | 🤖 AUTO: scrape ALL media from a channel |
-| `/scrape <post_link> old\|new [N]` | 🎯 scrape FROM that post — back in history (`old`) or toward the newest posts (`new`) |
+| `/scrape <url> [flags]` | 🤖 AUTO: scrape the **whole channel**. Works with ANY link — a post link names the same channel (`old`=oldest first, `new`=newest first, `N`=cap at N messages) |
+| `/scrape <post_link> from old\|new [N]` | 🎯 scrape FROM that post — back in history (`old`) or toward the newest posts (`new`) |
 | `/stop_scrape` | 🛑 stop the active scrape |
 | `/scrape_status` | 📊 check scrape progress (shows `Last msg ID` — use it with `min=N` to resume) |
 | `/caption <text>` | 📝 set a custom caption (replaces original on all forwards) |
@@ -180,7 +180,10 @@ Iterates ALL messages in the channel and sends media in parallel. See [Scraping]
 | `/cancel` | Cancel any pending forward for this chat |
 
 You can also trigger a from-point scrape **without a command**: send (or forward) a post
-link with `#old` / `#new` appended — see [Scraping from a specific post](#scraping-from-a-specific-post-old--new).
+link with `#old` / `#new` appended — see [Scraping from a specific post](#scraping-from-a-specific-post-from-old--from-new).
+
+> **Sending just the link** (no `/scrape`, no hashtag) always forwards **only that
+> one post** — `/scrape` is what escalates it to a whole-channel run.
 
 ---
 
@@ -306,10 +309,12 @@ upload directly to the bot is never modified.
 
 `/scrape <url> [flags]` is the most powerful command — it iterates all messages in a channel and forwards each media message to your destination.
 
+**Any link works**: a channel link (`t.me/c/<id>`, `t.me/<name>`) or a post link (`t.me/c/<id>/<msg>`, `t.me/<name>/<msg>`) — both name the same channel, and `/scrape` **always scrapes the whole channel/group** according to the flags. The post id only becomes the anchor when you explicitly add `from`.
+
 ### Syntax
 
 ```
-/scrape <channel_url> [flags]
+/scrape <any_url> [flags]
 ```
 
 ### Flags (any combination)
@@ -317,6 +322,8 @@ upload directly to the bot is never modified.
 | Flag | Effect |
 |---|---|
 | `old` | Oldest first (chronological order). Default: newest first. |
+| `new` | Newest first (the default — accepted for symmetry) |
+| `N` / `count=N` | Cap the run at **N delivered messages** (after the media filter — `photo 100` = 100 photos). Default: no cap. |
 | `saved` | Send to Saved Messages. Default: destination group. |
 | `photo` / `photos` | Only photos |
 | `video` / `videos` | Only videos |
@@ -328,18 +335,16 @@ upload directly to the bot is never modified.
 | `min=N` | **Resume**: skip messages with id <= N (use after an interrupted newest-first run) |
 | `max=N` | **Resume**: stop after messages with id > N (use after an interrupted oldest-first run) |
 
-If no media type filter is specified, ALL media is forwarded.
+If no media type filter is specified, ALL media is forwarded. A capped run (`N`) shows a real progress bar + % + ETA in `/scrape_status`, and the final status notes `Stopped at limit: N`.
 
-### Scraping from a specific post (`old` / `new`)
+### Scraping from a specific post (`from old` / `from new`)
 
-Give `/scrape` a **post link** plus a direction and it scrapes from exactly
-that point instead of the whole channel — or skip the command entirely and
-just append the hashtag to a link:
+Add the explicit `from` flag to a **post link** and it scrapes from exactly that point instead of the whole channel — or skip the command entirely and just append the hashtag to a link:
 
 ```
-/scrape https://t.me/c/1234567890/42 new        # post #42 + the next 49 posts
-/scrape https://t.me/somechannel/500 old 100    # post #500 + the previous 99
-/scrape https://t.me/c/1234567890/42 new videos # from that point, videos only
+/scrape https://t.me/c/1234567890/42 from new      # post #42 + the next 49 posts
+/scrape https://t.me/somechannel/500 from old 100  # post #500 + the previous 99
+/scrape https://t.me/c/1234567890/42 from new videos  # from that point, videos only
 
 https://t.me/c/1234567890/42 #new               # same, bare-message form
 https://t.me/somechannel/500 #old 200           # bare form with a count
@@ -347,35 +352,30 @@ https://t.me/somechannel/500 #old 200           # bare form with a count
 
 | Flag | Effect |
 |---|---|
+| `from` | Scrape **from the linked post** instead of the whole channel (needs a POST link + `old`/`new`) |
 | `old` | Walk **back in history** from the linked post (inclusive) |
 | `new` | Walk **toward the newest posts** from the linked post (inclusive) |
-| `<count>` / `count=N` / `#old100` | Max messages per run (default 50, max 500) |
+| `N` / `count=N` / `#old100` | Max messages per run (default 50, max 500) |
 | `#old` / `#new` | Same directions in a bare message (no command needed) |
 
 Differences from whole-channel scraping:
 
-- **Everything is forwarded** — text posts included — unless you add a media
-  filter. From-point scraping mirrors the channel, not just its media.
-- Messages are delivered in **chronological order** (the destination reads
-  like the source); albums keep their item order.
-- The final status message shows the exact range covered (`#first … #last`)
-  so you know where to continue from.
-- A post link **without** a direction flag still means "whole channel"
-  (legacy behavior), and a bare link without a hashtag still opens the
-  one-post topic picker — the flag is what selects the scrape behavior.
-- Works with `/strip`, `/caption`, `saved`, and `parallel=N` exactly like
-  whole-channel scraping. `/stop_scrape` cancels it.
+- **Everything is forwarded** — text posts included — unless you add a media filter. From-point scraping mirrors the channel, not just its media.
+- Messages are delivered in **chronological order** (the destination reads like the source); albums keep their item order.
+- The final status message shows the exact range covered (`#first … #last`) so you know where to continue from.
+- **Without `from`**, `old`/`new` on a post link are just delivery-order flags for a whole-channel run (`/scrape <post> old 100` = whole channel, oldest first, first 100) — and a bare link without a hashtag still forwards only that one post. The `from` flag (or the `#old`/`#new` hashtag) is what selects the from-point behavior.
+- Works with `/strip`, `/caption`, `saved`, and `parallel=N` exactly like whole-channel scraping. `/stop_scrape` cancels it.
 
 ### Examples
 
 ```
 /scrape https://t.me/publicchannel
 /scrape https://t.me/c/1234567890
-/scrape https://t.me/c/1234567890 saved old
-/scrape https://t.me/c/1234567890 photo video         # only photos + videos
-/scrape https://t.me/c/1234567890 saved old videos parallel=5  # all options
-/scrape https://t.me/c/1234567890 min=1042           # resume after interruption
-/scrape https://t.me/c/1234567890/42 new 100         # from post #42, forward
+/scrape https://t.me/c/1234567890/42 old 100     # WHOLE channel: oldest first, first 100
+/scrape https://t.me/c/1234567890 photo video    # only photos + videos
+/scrape https://t.me/c/1234567890 saved old      # oldest first -> Saved Messages
+/scrape https://t.me/c/1234567890 min=1042       # resume after interruption
+/scrape https://t.me/c/1234567890/42 from new 100  # FROM post #42, toward the newest
 ```
 
 ### How it works

@@ -2014,6 +2014,7 @@ class UserSession:
         reverse: bool = False,
         min_id: int = 0,
         max_id: int = 0,
+        limit: int = 0,
         cancel_event=None,
         progress_callback=None,
         status_callback=None,
@@ -2021,6 +2022,8 @@ class UserSession:
         media_types: list[str] | None = None,
         parallel: int = 3,
         custom_caption: str | None = None,
+        strip_captions: bool = False,
+        strip_links: bool = False,
     ) -> dict:
         """Iterate all messages in a channel and forward each media message
         to the destination chat. Used by the /scrape command.
@@ -2032,7 +2035,13 @@ class UserSession:
           reverse: if True, oldest first (default: newest first)
           min_id: skip messages with id <= min_id
           max_id: skip messages with id > max_id (or 0 for no upper bound)
+          limit: stop once this many messages have been SELECTED for
+            sending (after the media filter) — a limit of 30 with `photo`
+            means 30 photos. 0 = no limit. Albums may overshoot slightly:
+            an album already buffered is never split mid-group.
           cancel_event: asyncio.Event — set to cancel scraping
+          strip_captions: /strip captions — media posts lose their caption
+          strip_links: /strip links — URLs removed from surviving text
           progress_callback: async callable(sent, total_seen, last_msg_id, label)
           status_callback: async callable(status_text) — for status updates
           media_types: list of types to include. None means all media.
@@ -2085,6 +2094,7 @@ class UserSession:
             "total_seen": 0,
             "last_message_id": 0,
             "cancelled": False,
+            "hit_limit": False,   # stopped early because `limit` was reached
             "flood_waits": 0,
         }
 
@@ -2103,6 +2113,7 @@ class UserSession:
                 f"   → destination: {getattr(dest_entity, 'title', dest_chat_id)}"
                 f"{f' (topic {topic_id})' if topic_id else ''}\n"
                 f"   order: {'oldest first' if reverse else 'newest first'}"
+                + (f"\n   limit: {limit} message(s)" if limit else "")
             )
 
         # Build kwargs for iter_messages
@@ -2171,6 +2182,8 @@ class UserSession:
                 topic_id=topic_id,
                 progress_callback=None,
                 custom_caption=custom_caption,
+                strip_captions=strip_captions,
+                strip_links=strip_links,
                 pre_messages=msgs,
                 source_entity=source_entity,
                 dest_entity=dest_entity,
@@ -2226,6 +2239,11 @@ class UserSession:
         # share a grouped_id and dispatch them together when the group ends.
         album_buffer: list = []
         album_grouped_id = None
+
+        # ---- whole-channel limit state ----
+        # `selected` counts messages chosen for sending AFTER the media
+        # filter — with `photo` + limit=30 that's 30 photos, not 30 seen.
+        selected = 0
 
         def _flush_album():
             nonlocal album_buffer, album_grouped_id
@@ -2299,6 +2317,15 @@ class UserSession:
                         _asyncio.create_task(_send_with_semaphore([msg]))
                     )
 
+                # ---- whole-channel limit: stop once enough messages have
+                # been selected for sending. In-flight sends complete; an
+                # album already buffered is never split mid-group (the cap
+                # may overshoot by the tail of one album, by design). ----
+                selected += 1
+                if limit and selected >= limit:
+                    result["hit_limit"] = True
+                    break
+
                 # Periodically drain completed tasks to avoid the list growing
                 # unboundedly for huge channels.
                 if len(pending_send_tasks) >= parallel * 4:
@@ -2347,7 +2374,7 @@ class UserSession:
                         title=(getattr(source_entity, "title", None)
                                 or str(source_chat_ref)),
                         sent=result["sent_count"],
-                        total=None,
+                        total=(limit or None),
                         failed=result["failed_count"],
                         skipped=result["skipped_count"],
                         flood_waits=result["flood_waits"],
@@ -2382,8 +2409,11 @@ class UserSession:
 
         # Final status
         if status_callback and not result["cancelled"]:
+            limit_note = ""
+            if result.get("hit_limit"):
+                limit_note = f"\nStopped at limit: {limit} message(s) selected"
             await status_callback(
-                f"✅ Scraping complete!\n\n"
+                f"✅ Scraping complete!{limit_note}\n\n"
                 f"Total seen: {result['total_seen']}\n"
                 f"Sent: {result['sent_count']}\n"
                 f"Failed: {result['failed_count']}\n"

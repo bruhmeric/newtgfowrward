@@ -114,8 +114,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/whoami         — show your Telegram user ID + admin status\n"
         "/test_link <url>  — diagnostic: test fetching a t.me link\n"
         "/saved <url>    — 🚀 FAST: send t.me link content to Saved Messages\n"
-        "/scrape <url> [flags]  — 🤖 AUTO: scrape ALL media from a channel\n"
-        "/scrape <post_link> old|new [N]  — 🎯 scrape from that post,\n"
+        "/scrape <url> [flags]  — 🤖 AUTO: scrape the WHOLE channel. Works\n"
+        "     with any link — a POST link identifies the same channel.\n"
+        "     `old`=oldest first · `new`=newest first · `N`=cap at N msgs\n"
+        "/scrape <post_link> from old|new [N]  — 🎯 scrape from that post,\n"
         "     back in history (old) or toward the newest posts (new), N msgs\n"
         "/dest           — 📌 view / change the DEFAULT destination\n"
         "     `/dest saved on` — Saved Messages is the default (even if a\n"
@@ -135,17 +137,22 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/saved <url>` -> skip the picker, send directly to Saved Messages "
         "(fastest path)\n"
         "• `/scrape <url>` -> scrape the entire channel and auto-send all "
-        "media to your destination\n"
+        "media to your destination (a post link works too — it names the "
+        "same channel; the post itself is only the anchor with `from`)\n"
         "• Send a post link with `#old` / `#new` appended (e.g. "
         "`https://t.me/c/1234567890/42 #new`) -> scrape from that post "
-        "backward or forward — same as `/scrape <link> old|new`\n"
+        "backward or forward — same as `/scrape <link> from old|new`\n"
         "\n*Scrape flags*\n"
-        "  `old` / `new` — direction FROM a post link (includes that post)\n"
-        "  `<count>` / `count=N` — max messages from the point (default 50)\n"
+        "  `old` / `new` — delivery order: oldest / newest first\n"
+        "  `N` / `count=N` — cap the run at N messages\n"
+        "  `from` — with a post link: scrape FROM that post (needs old/new)\n"
         "  `saved` — send to Saved Messages (default: destination group)\n"
         "  `photo` / `video` / `doc` / `audio` / `voice` / `animation` — filter by media type\n"
         "  `parallel=N` — set parallel sends (default 3, max 10)\n"
-        "  Example: `/scrape https://t.me/c/123/456 new 100 videos parallel=5`\n"
+        "  Example: `/scrape https://t.me/c/123/456 old 100 videos parallel=5`\n"
+        "     (whole channel: oldest first, first 100, videos only)\n"
+        "  Example: `/scrape https://t.me/c/123/456 from new 100`\n"
+        "     (from post #456 toward the newest, max 100)\n"
         "\n*Captions & links (/strip)*\n"
         "  `/strip captions on|off` — forward media WITHOUT its caption\n"
         "  `/strip links on|off` — remove URLs/hyperlinks from forwarded text\n"
@@ -700,35 +707,176 @@ async def cmd_saved(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# /scrape flag parsing — ONE routing engine, unit-tested in smoke_test.py
+#
+# THE ROUTING RULE (what users expect):
+#   * /scrape <ANY link> [flags] → scrape the WHOLE channel/group.
+#     A POST link identifies the channel exactly like a channel link does;
+#     its message id is ignored except in explicit `from` mode.
+#       - old/oldest → oldest first · new/newest → newest first (default)
+#       - N / count=N → cap the run at N delivered messages (0 = all)
+#       - saved/group, media filters, parallel=N, min=N/max=N as before
+#   * /scrape <post_link> from old|new [N] → from-point scrape (explicit
+#     `from` flag — plain old/new NEVER trigger from-point on /scrape)
+#   * a bare post link with NO /scrape → forward ONLY that post (link.py);
+#     appending #old / #new to a bare link selects from-point there.
+# ---------------------------------------------------------------------------
+
+# Order/direction aliases. On a whole-channel run they pick the delivery
+# order; with the explicit `from` flag on a post link they pick the direction.
+_SCRAPE_NEW = {"new", "newer", "newest", "fwd"}
+_SCRAPE_OLD = {"old", "older", "oldest", "back"}
+_SCRAPE_MEDIA = {"photo", "video", "animation", "document", "audio", "voice"}
+_SCRAPE_MEDIA_ALIAS = {"photos": "photo", "videos": "video", "docs": "document"}
+_SCRAPE_POINT_DEFAULT = 50   # from-point count when none given
+_SCRAPE_LIMIT_MAX = 100_000  # whole-channel cap (effectively unlimited)
+
+
+def _parse_scrape_flags(raw_flags: list[str], url: str) -> dict:
+    """Parse /scrape arguments into a single routing decision.
+
+    Returns a dict:
+      mode           'whole-channel' | 'from-point' | 'error'
+      error          None | user-facing message (mode='error')
+      direction      'old' | 'new' | None — order (whole-channel) /
+                     direction (from-point)
+      limit          int — whole-channel: max delivered (0=all);
+                     from-point: count (default 50, max 500)
+      media_types    list | None (None = all media)
+      parallel       int 1..10
+      min_id/max_id  int (resume bounds)
+      saved/group    bool
+      parsed_post    ParsedLink | None (url is a post link)
+      parsed_channel ParsedLink | None (channel-only link, or a post link
+                     demoted to message_id=0 — the post id only matters in
+                     `from` mode)
+    """
+    from user_session import parse_telegram_link, parse_channel_link
+
+    out: dict = {
+        "mode": "whole-channel",
+        "error": None,
+        "direction": None,
+        "limit": 0,
+        "media_types": None,
+        "parallel": 3,
+        "min_id": 0,
+        "max_id": 0,
+        "saved": False,
+        "group": False,
+        "parsed_post": None,
+        "parsed_channel": None,
+    }
+
+    for flag in raw_flags:
+        actual = _SCRAPE_MEDIA_ALIAS.get(flag, flag)
+        if actual in _SCRAPE_MEDIA:
+            if out["media_types"] is None:
+                out["media_types"] = []
+            if actual not in out["media_types"]:
+                out["media_types"].append(actual)
+        elif flag == "saved":
+            out["saved"] = True
+        elif flag == "group":
+            out["group"] = True
+        elif flag.startswith("parallel="):
+            try:
+                out["parallel"] = max(1, min(int(flag.split("=", 1)[1] or 3), 10))
+            except ValueError:
+                pass
+        elif flag.startswith(("min=", "max=")):
+            try:
+                v = max(0, int(flag.split("=", 1)[1]))
+                if flag.startswith("min="):
+                    out["min_id"] = v
+                else:
+                    out["max_id"] = v
+            except ValueError:
+                pass
+        elif flag.startswith("count="):
+            try:
+                out["limit"] = int(flag.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif flag.isdigit():
+            # bare number: whole-channel cap (or the from-point count with `from`)
+            out["limit"] = int(flag)
+        # 'from' / 'old' / 'new' and their aliases are resolved below —
+        # they are never media/destination/knob flags
+
+    if any(f in _SCRAPE_NEW for f in raw_flags):
+        out["direction"] = "new"
+    elif any(f in _SCRAPE_OLD for f in raw_flags):
+        out["direction"] = "old"
+
+    parsed_post = parse_telegram_link(url)
+    out["parsed_post"] = parsed_post
+
+    if "from" in raw_flags:
+        # EXPLICIT from-point request — plain old/new never trigger this
+        if parsed_post is None:
+            out["mode"] = "error"
+            out["error"] = (
+                "`from` needs a POST link — the message id is the anchor.\n"
+                "Try: `/scrape https://t.me/c/1234567890/42 from new 100`\n"
+                "(a channel-only link has no anchor post — for the whole "
+                "channel just drop `from`)")
+        elif out["direction"] is None:
+            out["mode"] = "error"
+            out["error"] = (
+                "`from` needs a direction — add `old` (back in history) or "
+                "`new` (toward the newest posts).\n"
+                "Try: `/scrape <post_link> from old 100`")
+        else:
+            out["mode"] = "from-point"
+            if not out["limit"]:
+                out["limit"] = _SCRAPE_POINT_DEFAULT
+            out["limit"] = max(1, min(out["limit"], 500))
+
+    # The channel the URL points at. A post link is demoted to
+    # message_id=0 — the post id only matters in `from` mode.
+    parsed_channel = parse_channel_link(url)
+    if not parsed_channel and parsed_post:
+        parsed_channel = type(parsed_post)(kind=parsed_post.kind,
+                                           chat_ref=parsed_post.chat_ref,
+                                           message_id=0)
+    out["parsed_channel"] = parsed_channel
+
+    if out["mode"] == "whole-channel" and out["limit"]:
+        out["limit"] = max(1, min(out["limit"], _SCRAPE_LIMIT_MAX))
+    return out
+
+
 async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Scrape a channel — send all media (photos/videos) to destination.
 
     Usage:
-      /scrape <channel_url> [flags]
+      /scrape <url> [flags]
 
-    Flags (any combination, space-separated):
-      old           — oldest first (chronological order)
+    ANY link works — a channel link OR a post link (the post just
+    identifies the channel) — and /scrape ALWAYS scrapes the WHOLE
+    channel/group according to the flags:
+      old / new     — delivery order: oldest / newest first (default newest)
+      N / count=N   — cap the run at N delivered messages (0 = all)
+      from          — with a post link + old/new: scrape FROM that post
       saved         — send to Saved Messages (default: destination group)
-      photo         — only photos
-      video         — only videos
-      doc           — only documents
-      audio         — only audio
-      voice         — only voice messages
-      animation     — only animations (GIFs)
-      photos        — only photos (alias)
-      videos        — only videos (alias)
-      docs          — only documents (alias)
-      parallel=N    — set parallel send count (default 3, max 10)
+      photo/video/doc/audio/voice/animation — media type filter
+      photos/videos/docs — aliases
+      parallel=N    — parallel sends (default 3, max 10)
+      min=N / max=N — resume bounds for whole-channel runs
 
     Examples:
       /scrape https://t.me/publicchannel
-      /scrape https://t.me/c/1234567890 saved old
-      /scrape https://t.me/c/1234567890 photo video   — only photos and videos
+      /scrape https://t.me/c/1234567890/42 old 100  — whole channel, oldest first, first 100
+      /scrape https://t.me/c/1234567890 photo video — whole channel, only photos and videos
+      /scrape https://t.me/c/1234567890/42 from new — FROM post #42 toward the newest
       /scrape https://t.me/c/1234567890 saved old videos parallel=5
 
     Notes:
       - If no media type filter is given, ALL media is forwarded
       - Text-only messages are always skipped (they have no media)
+      - Sending just the link WITHOUT /scrape forwards ONLY that post
       - Rate limit: 0.3 sec delay between sends (per parallel slot)
       - On FloodWait, the bot sleeps and retries automatically
       - Protected (noforwards) channels use the same three-tier fallback
@@ -760,127 +908,83 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not context.args:
         await update.effective_message.reply_text(
             "Usage: `/scrape <url> [flags]`\n\n"
-            "🎯 From a specific post (add old / new):\n"
-            "  `/scrape https://t.me/c/1234567890/42 new` — from post #42 → newer\n"
-            "  `/scrape https://t.me/c/1234567890/42 old 100` — post #42 + 99 older\n"
-            "  (you can also just send the link with #old / #new appended)\n\n"
-            "Whole channel:\n"
-            "  `/scrape https://t.me/publicchannel`\n\n"
+            "🤖 Whole channel — works with ANY link (a post link just\n"
+            "identifies the channel, same as a channel link):\n"
+            "  `/scrape https://t.me/publicchannel`\n"
+            "  `/scrape https://t.me/c/1234567890/42 old 100`\n"
+            "     → whole channel, oldest first, first 100 messages\n"
+            "  `/scrape https://t.me/c/1234567890 saved`\n"
+            "     → whole channel → Saved Messages\n\n"
+            "🎯 From a specific post (add `from` + old/new):\n"
+            "  `/scrape https://t.me/c/1234567890/42 from new 100`\n"
+            "     → from post #42 toward the newest, max 100\n"
+            "  (or just send the link with #old / #new appended — no command)\n\n"
             "Flags:\n"
-            "  `old` / `new` — from-point direction (needs a POST link)\n"
-            "  `<count>` or `count=N` — max messages from that point (default 50, max 500)\n"
+            "  `old` / `new` — delivery order: oldest / newest first\n"
+            "  `N` or `count=N` — cap the run at N messages\n"
+            "  `from` — with a post link: scrape FROM that post (needs old/new)\n"
             "  `saved` — send to Saved Messages (default: destination group)\n"
             "  `photo` / `video` / `doc` / `audio` / `voice` / `animation` — media filter\n"
             "  `parallel=N` — parallel sends (default 3, max 10)\n"
             "  `min=N` / `max=N` — resume bounds for whole-channel runs\n\n"
             "Notes:\n"
-            "  • From-point runs forward EVERYTHING (text posts included)\n"
-            "    unless a media filter is given\n"
-            "  • The linked post itself is included\n"
-            "  • Messages arrive in chronological order",
+            "  • `/scrape` + ANY link = the WHOLE channel per the flags\n"
+            "  • a bare link WITHOUT /scrape forwards ONLY that post\n"
+            "  • from-point runs include text posts unless a media filter\n"
+            "    is given; the linked post itself is always included",
             parse_mode="Markdown",
         )
         return
 
-    # Parse args: first arg is URL, rest are flags
+    # Parse args: first arg is URL, rest are flags — ONE routing engine
+    # (_parse_scrape_flags above, unit-tested in smoke_test.py)
     url = context.args[0]
     raw_flags = [a.lower() for a in context.args[1:]]
-    send_to_saved = "saved" in raw_flags
-    send_to_group = "group" in raw_flags
-    oldest_first = "old" in raw_flags or "oldest" in raw_flags
+    flags = _parse_scrape_flags(raw_flags, url)
 
-    # Parse media type filters
-    valid_media_types = {"photo", "video", "animation", "document", "audio", "voice"}
-    # Aliases: photos -> photo, videos -> video, docs -> document
-    alias_map = {"photos": "photo", "videos": "video", "docs": "document"}
-    media_types: list[str] = []
-    parallel = 3  # default
-    min_id = 0    # RESUME flag: skip messages with id <= min_id
-    max_id = 0    # RESUME flag: stop at messages with id > max_id
-    for flag in raw_flags:
-        # Resolve aliases
-        actual = alias_map.get(flag, flag)
-        if actual in valid_media_types:
-            if actual not in media_types:
-                media_types.append(actual)
-        elif flag.startswith("parallel="):
-            try:
-                p = int(flag.split("=", 1)[1])
-                parallel = max(1, min(p, 10))  # clamp 1..10
-            except ValueError:
-                pass
-        elif flag.startswith("min="):
-            try:
-                min_id = max(0, int(flag.split("=", 1)[1]))
-            except ValueError:
-                pass
-        elif flag.startswith("max="):
-            try:
-                max_id = max(0, int(flag.split("=", 1)[1]))
-            except ValueError:
-                pass
-    # If no media types specified, set to None (all media)
-    if not media_types:
-        media_types = None
-
-    # ---- from-point mode: POST link + direction flag (old/new) ----
-    # /scrape https://t.me/c/123/456 new 100   → scrape from post #456
-    # forward; a post link + `old` walks back instead. Without a direction
-    # flag a post link still means "whole channel" (legacy behavior).
-    from user_session import parse_telegram_link as _parse_post_link
-    parsed_post = _parse_post_link(url)
-    direction = None
-    if "new" in raw_flags or "newer" in raw_flags:
-        direction = "new"
-    elif "old" in raw_flags or "older" in raw_flags or "back" in raw_flags:
-        direction = "old"
-    point_count = None
-    for flag in raw_flags:
-        if flag.startswith("count="):
-            try:
-                point_count = int(flag.split("=", 1)[1])
-            except ValueError:
-                pass
-        elif flag.isdigit() and parsed_post is not None and direction:
-            point_count = int(flag)
-    if parsed_post and direction:
-        await run_scrape_from_point(
-            update, context, parsed_post, direction, point_count or 50,
-            media_types=media_types, parallel=parallel,
-            send_to_saved=send_to_saved,
-            prefer=("saved" if send_to_saved else
-                    "group" if send_to_group else None))
-        return
-    if parsed_post and point_count is not None and not direction:
+    if flags["error"]:
         await update.effective_message.reply_text(
-            "A count alone isn't enough — add a direction:\n"
-            "  `/scrape <post_link> old <count>` — back in history\n"
-            "  `/scrape <post_link> new <count>` — toward the newest posts",
-            parse_mode="Markdown",
-        )
+            f"❌ {flags['error']}", parse_mode="Markdown")
         return
 
-    # Try parsing as a channel-only link first, then fall back to a post link
-    parsed = parse_channel_link(url)
-    if not parsed:
-        # Maybe they passed a post link (t.me/c/123/42) — extract the channel part
-        parsed_post = parse_telegram_link(url)
-        if parsed_post:
-            # Use the same chat_ref but message_id=0 (whole channel)
-            parsed = type(parsed_post)(kind=parsed_post.kind,
-                                        chat_ref=parsed_post.chat_ref,
-                                        message_id=0)
+    # ---- from-point mode: EXPLICIT `from` flag on a post link ----
+    # /scrape https://t.me/c/123/456 from new 100 → scrape from post #456.
+    # Plain old/new (without `from`) do NOT trigger this — with a post
+    # link they mean "whole channel, oldest/newest first" instead.
+    if flags["mode"] == "from-point":
+        await run_scrape_from_point(
+            update, context, flags["parsed_post"], flags["direction"],
+            flags["limit"],
+            media_types=flags["media_types"],
+            parallel=flags["parallel"],
+            prefer=("saved" if flags["saved"] else
+                    "group" if flags["group"] else None))
+        return
+
+    # ---- whole-channel mode: ANY link (channel OR post) means the WHOLE
+    # channel/group; the post id in a post link only identifies WHICH
+    # channel. The flags decide order / limit / media / destination. ----
+    parsed = flags["parsed_channel"]
     if not parsed:
         await update.effective_message.reply_text(
             f"❌ Could not parse URL: `{url}`\n\n"
             f"Supported formats:\n"
             f"  • `https://t.me/c/1234567890`  (private channel)\n"
             f"  • `https://t.me/channelname`   (public channel)\n"
-            f"  • `https://t.me/c/1234567890/42`  (private channel + start msg)\n"
-            f"  • `https://t.me/channelname/42`   (public channel + start msg)",
+            f"  • `https://t.me/c/1234567890/42`  (private post — same channel)\n"
+            f"  • `https://t.me/channelname/42`   (public post — same channel)",
             parse_mode="Markdown",
         )
         return
+
+    oldest_first = flags["direction"] == "old"
+    limit = flags["limit"]
+    media_types = flags["media_types"]
+    parallel = flags["parallel"]
+    min_id = flags["min_id"]
+    max_id = flags["max_id"]
+    send_to_saved = flags["saved"]
+    send_to_group = flags["group"]
 
     # Determine destination (explicit flags > /dest toggle > group > Saved fallback)
     from handlers.destination import resolve_destination
@@ -909,11 +1013,12 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     # Initial status message
     status_msg = await update.effective_message.reply_text(
-        f"🔍 Starting scrape...\n\n"
+        f"🔍 Starting scrape (whole channel)...\n\n"
         f"Source: `{parsed.chat_ref}`\n"
         f"{spec.dest_line}\n"
         f"Order: {'oldest first' if oldest_first else 'newest first'}\n"
         f"Filter: {filter_desc}\n"
+        f"Limit: {limit if limit else 'none — all messages'}\n"
         f"Parallel: {parallel} sends{resume_desc}\n\n"
         f"_Use /stop_scrape to cancel, /scrape_status to check progress._",
         parse_mode="Markdown",
@@ -936,6 +1041,10 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "parallel": parallel,
         "min_id": min_id,
         "max_id": max_id,
+        "limit": limit,
+        # With a cap the target is known up front → /scrape_status can
+        # show the progress bar + % + ETA (unlimited runs show rate only)
+        "expected_total": limit,
     }
 
     # Build the status callback that edits the status message AND updates
@@ -977,6 +1086,9 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         try:
             # Load the custom_caption setting (None=original, ""=strip, "<text>"=custom)
             custom_caption = await _get_custom_caption(context)
+            # /strip settings apply to /scrape too — whole-channel runs used
+            # to silently ignore them (fixed)
+            strip_captions, strip_links = await _get_strip_settings(context)
             await user_session.scrape_channel(
                 source_chat_ref=int(parsed.chat_ref) if parsed.kind == "private" else parsed.chat_ref,
                 dest_chat_id=dest_chat_id,
@@ -984,12 +1096,15 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 reverse=oldest_first,
                 min_id=min_id,
                 max_id=max_id,
+                limit=limit,
                 cancel_event=cancel_event,
                 status_callback=status_callback,
                 stats_callback=stats_callback,
                 media_types=media_types,
                 parallel=parallel,
                 custom_caption=custom_caption,
+                strip_captions=strip_captions,
+                strip_links=strip_links,
             )
         except Exception as e:
             logger.exception("/scrape task failed")
@@ -1274,7 +1389,7 @@ async def run_scrape_from_point(
     prefer: str | None = None,
 ) -> None:
     """Start a from-point scrape as a background task. Shared by:
-      * /scrape <post_link> old|new [count] [flags]
+      * /scrape <post_link> from old|new [count] [flags]
       * a bare message with a post link + #old / #new hashtag
 
     Performs the admin/session/destination checks and wires the status

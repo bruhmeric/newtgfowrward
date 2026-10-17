@@ -3,10 +3,70 @@
 This release fixes several real bugs, hardens the webhook server, and tunes
 the bot specifically for Render's free tier (512 MB RAM / 0.1 CPU / 15-min
 sleep / ephemeral disk). All changes are covered by `smoke_test.py`
-(121 checks) and `webhook_e2e_test.py` (28 checks) — run both locally with
+(148 checks) and `webhook_e2e_test.py` (28 checks) — run both locally with
 `pip install -r requirements.txt` first.
 
 ---
+
+## Routing fix: /scrape + post link = whole channel (per user report)
+
+**The reported problem.** "When I send a private post link with the scrape
+command it should scrape that whole channel/group according to the flags.
+When I send just the link without scrape it should only send that post."
+The second half already worked (a bare post link forwards just that post),
+but the first half did NOT: `/scrape <post link> old` was hijacked into a
+from-point run capped at 50 messages — instead of the whole channel,
+oldest first, that the user asked for. Three concrete defects:
+
+1. `old` / `new` on a post link silently selected **from-point** mode, so
+   `/scrape https://t.me/c/1234567890/42 old` scraped only 50 messages
+   backward from post #42 — not the whole channel. `/scrape <post> new
+   videos` became a 50-message from-point run instead of "whole channel,
+   newest first, videos only".
+2. A bare count was inconsistent: `/scrape <post> 100` (no direction) was
+   silently ignored (whole channel, uncapped) while `count=100` errored
+   with "A count alone isn't enough". Neither did what a user expects:
+   cap the run at 100.
+3. Whole-channel runs ignored `/strip` entirely — `strip_captions` /
+   `strip_links` were never passed to `scrape_channel`, despite `/strip`
+   help claiming it applies to `/scrape`.
+
+**The new routing rule** (one engine, `handlers/admin._parse_scrape_flags`,
+unit-tested in `smoke_test.py` section 20):
+
+- `/scrape <ANY link> [flags]` → **whole channel/group**. A post link
+  identifies the same channel a channel link does; its message id is
+  ignored. `old`/`oldest` → oldest first, `new`/`newest` → newest first,
+  `N`/`count=N` → cap at N delivered messages (counted after the media
+  filter, so `photo 100` = 100 photos).
+- From-point scraping is now **explicit only**: `/scrape <post_link> from
+  old|new [N]` — or the bare-message hashtag form (`link #old/#new`),
+  which is unchanged. Plain `old`/`new` never trigger from-point anymore.
+- A bare post link without `/scrape` (and without `#old`/`#new`) still
+  forwards **only that post** — exactly as the user specified.
+
+**Engine changes** (`user_session.scrape_channel`):
+
+- New `limit` parameter: stops iterating once N messages have been
+  selected for sending (after the media filter). Never splits an album
+  that's already buffered. `result["hit_limit"]` + `Stopped at limit: N`
+  in the final status; capped runs show the real progress bar + % + ETA
+  (the target is known up front), and `/scrape_status` gets
+  `expected_total` seeded.
+- New `strip_captions` / `strip_links` parameters, passed through to
+  `send_to_destination` — whole-channel `/scrape` now honors `/strip`.
+- Initial status line announces the limit; periodic status passes
+  `total=limit` so the bar renders.
+
+**Docs**: `/help`, the `/scrape` usage text, and the README (Scraping
+chapter, command table, examples) all document the new rule.
+
+**Tests**: `smoke_test.py` 121 → **148 checks** (new sections 20 + 21:
+routing matrix incl. regression checks for the old hijack, from-point
+`from` errors, link demotion, fake-client limit/stop-early/reverse-order/
+strip-passthrough/status-announcement tests). `webhook_e2e_test.py` still
+28/28. Backward-incompatible: anyone who relied on `/scrape <post> old`
+being from-point must add `from`.
 
 ## Feature release 2: Saved Messages destination + live progress
 

@@ -855,5 +855,236 @@ finally:
     pcfg.destination_group_id = _old_group
 
 print()
+print("== 20. /scrape routing engine (post link = whole channel) ==")
+from handlers.admin import _parse_scrape_flags  # noqa: E402
+
+
+def _route(flags, url):
+    return _parse_scrape_flags([a.lower() for a in flags], url)
+
+
+# A. the user's core requirement: /scrape + private POST link = WHOLE channel
+r = _route(["old", "100"], "https://t.me/c/1234567890/42")
+check("post link + old 100 -> whole channel, oldest first, limit 100",
+      r["mode"] == "whole-channel" and r["direction"] == "old"
+      and r["limit"] == 100, str(r))
+r = _route(["new", "videos"], "https://t.me/c/1234567890/42")
+check("post link + new videos -> whole channel, newest, video filter",
+      r["mode"] == "whole-channel" and r["direction"] == "new"
+      and r["media_types"] == ["video"], str(r))
+r = _route(["saved", "old"], "https://t.me/c/1234567890/42")
+check("post link + saved old -> whole channel to Saved, oldest first",
+      r["mode"] == "whole-channel" and r["saved"] and r["direction"] == "old")
+r = _route(["100"], "https://t.me/c/1234567890/42")
+check("bare count (no direction) is now a limit, not an error/nonsense",
+      r["mode"] == "whole-channel" and r["limit"] == 100, str(r))
+r = _route(["count=250"], "https://t.me/c/1234567890/42")
+check("count=250 parsed as whole-channel limit", r["limit"] == 250)
+
+# B. from-point now requires the explicit `from` flag
+r = _route(["from", "new", "100"], "https://t.me/c/1234567890/42")
+check("from new 100 -> from-point, count 100",
+      r["mode"] == "from-point" and r["direction"] == "new" and r["limit"] == 100)
+r = _route(["from", "old"], "https://t.me/c/1234567890/42")
+check("from old (no count) -> from-point default 50",
+      r["mode"] == "from-point" and r["limit"] == 50)
+r = _route(["from", "old", "999"], "https://t.me/c/1234567890/42")
+check("from-point count clamped to 500", r["limit"] == 500)
+r = _route(["from"], "https://t.me/c/1234567890/42")
+check("from without direction -> error with guidance",
+      r["mode"] == "error" and "direction" in r["error"])
+r = _route(["from", "old"], "https://t.me/c/1234567890")
+check("from on a channel link -> error pointing at post links",
+      r["mode"] == "error" and "POST link" in r["error"])
+
+# C. regression: the old old/new hijack on post links is gone
+r = _route(["old"], "https://t.me/c/1234567890/42")
+check("REGRESSION: post link + old is whole-channel (was from-point hijack)",
+      r["mode"] == "whole-channel", str(r))
+r = _route(["new"], "https://t.me/somechannel/500")
+check("REGRESSION: public post link + new is whole-channel newest-first",
+      r["mode"] == "whole-channel" and r["direction"] == "new")
+
+# D. link resolution: a post link names the SAME channel
+r = _route(["old", "20"], "https://t.me/somechannel/500")
+check("public post link + old 20 -> whole channel oldest, limit 20",
+      r["mode"] == "whole-channel" and r["direction"] == "old" and r["limit"] == 20)
+r = _route([], "https://t.me/c/1234567890/42")
+check("post link demotes to channel (message_id=0, same chat_ref), anchor kept",
+      r["parsed_channel"].message_id == 0
+      and r["parsed_channel"].chat_ref == "-1001234567890"
+      and r["parsed_post"] is not None and r["parsed_post"].message_id == 42)
+
+# E. flag plumbing through the engine
+r = _route(["saved", "oldest", "photos", "parallel=7", "min=10", "max=900"],
+           "https://t.me/c/1234567890/42")
+check("alias plumbing: photos->photo, parallel/min/max/saved parsed",
+      r["media_types"] == ["photo"] and r["parallel"] == 7
+      and r["min_id"] == 10 and r["max_id"] == 900 and r["saved"] is True, str(r))
+r = _route(["parallel="], "https://t.me/c/1234567890/42")
+check("parallel= with junk falls back to 3", r["parallel"] == 3)
+
+# F. bare-link behavior is untouched: only that post, unless #old/#new
+check("bare link without hashtag is NOT a from-point request",
+      us_mod.parse_scrape_point_request("https://t.me/c/1234567890/42") is None)
+_pt = us_mod.parse_scrape_point_request("https://t.me/c/1234567890/42 #new 200")
+check("bare link + #new 200 still selects from-point",
+      _pt is not None and _pt[1] == "new" and _pt[2] == 200)
+check("'#news' does NOT trigger from-point (word boundary)",
+      us_mod.parse_scrape_point_request(
+          "https://t.me/c/1234567890/42 #news") is None)
+
+
+print()
+print("== 21. scrape_channel limit + /strip passthrough (fake client) ==")
+
+
+async def scrape_limit_tests() -> None:
+    from telethon.tl.types import MessageMediaPhoto
+
+    class FakeEnt:
+        def __init__(self, id_, title="Chan"):
+            self.id = id_
+            self.title = title
+
+    class FakeMsg:
+        def __init__(self, id_, media, text=""):
+            self.id = id_
+            self.message = text
+            self.media = media
+            self.entities = None
+            self.grouped_id = None
+            self.action = None
+
+    class FakeClient:
+        """Records forward/send calls; iter_messages yields a fixed list.
+
+        Telethon semantics: NEWEST first by default, OLDEST first with
+        reverse=True — the fake honors both so order tests are real.
+        """
+
+        def __init__(self, msgs):
+            self._msgs = msgs
+            self.forwards = []
+            self.sends = []
+
+        async def forward_messages(self, dest, ids, src):
+            self.forwards.append(list(ids))
+            return True
+
+        async def send_message(self, dest, **kw):
+            self.sends.append(kw)
+            return True
+
+        def iter_messages(self, entity, **kwargs):
+            msgs = list(self._msgs)
+            if not kwargs.get("reverse"):
+                msgs = msgs[::-1]  # newest first (Telethon default)
+
+            class _Iter:
+                _i = 0
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    if self._i >= len(msgs):
+                        raise StopAsyncIteration
+                    m = msgs[self._i]
+                    self._i += 1
+                    return m
+            return _Iter()
+
+    us = us_mod.UserSession("t", 12345, "abcdef",
+                            session_string=_make_session_string(2, "149.154.167.51"))
+    src, dst = FakeEnt(-100123), FakeEnt(-100999)
+
+    async def fake_resolve(ref):
+        return src if ref == -100123 else dst
+    us._get_entity_with_warmup = fake_resolve
+
+    # 10 media posts (ids 1..10, caption "cap N") interleaved with 5 text
+    # posts (ids 101..105) — text posts have no media and must be skipped.
+    photo = MessageMediaPhoto()
+    all_msgs = []
+    for i in range(1, 11):
+        all_msgs.append(FakeMsg(i, photo, text=f"cap {i}"))
+        if i <= 5:
+            all_msgs.append(FakeMsg(100 + i, None, text=f"text {i}"))
+
+    # A. limit=4 -> exactly the 4 NEWEST media, hit_limit=True, stop early
+    fc = FakeClient(all_msgs)
+    us.client = fc
+    res = await us.scrape_channel(
+        source_chat_ref=-100123, dest_chat_id=-100999,
+        limit=4, parallel=10)
+    check("limit=4 -> exactly 4 newest media selected & sent",
+          res["hit_limit"] is True and res["sent_count"] == 4
+          and sorted(f[0] for f in fc.forwards) == [7, 8, 9, 10],
+          f"res={res} forwards={fc.forwards}")
+    check("limit run stops iterating early (total_seen < all 15)",
+          res["total_seen"] < 15, str(res["total_seen"]))
+
+    # B. no limit -> all 10 media, text posts skipped, hit_limit False
+    fc = FakeClient(all_msgs)
+    us.client = fc
+    res = await us.scrape_channel(
+        source_chat_ref=-100123, dest_chat_id=-100999, parallel=10)
+    check("no limit -> all 10 media sent, 5 text posts skipped",
+          res["hit_limit"] is False and res["sent_count"] == 10
+          and res["skipped_count"] == 5, f"res={res}")
+
+    # C. reverse + limit -> the OLDEST messages are selected
+    fc = FakeClient(all_msgs)
+    us.client = fc
+    res = await us.scrape_channel(
+        source_chat_ref=-100123, dest_chat_id=-100999,
+        reverse=True, limit=3, parallel=10)
+    check("oldest-first + limit=3 -> ids 1,2,3 selected",
+          res["hit_limit"] is True and res["sent_count"] == 3
+          and sorted(f[0] for f in fc.forwards) == [1, 2, 3],
+          f"res={res} forwards={fc.forwards}")
+
+    # D. /strip captions now reaches whole-channel sends (was ignored)
+    fc = FakeClient(all_msgs)
+    us.client = fc
+    res = await us.scrape_channel(
+        source_chat_ref=-100123, dest_chat_id=-100999,
+        limit=2, parallel=10, strip_captions=True)
+    check("/strip captions passthrough on whole-channel runs",
+          res["sent_count"] == 2 and not fc.forwards
+          and len(fc.sends) == 2 and fc.sends[0]["message"] == "",
+          f"sends={fc.sends}")
+
+    # E. media filter + limit counts FILTERED messages (2 photos, not 2 seen)
+    fc = FakeClient(all_msgs)
+    us.client = fc
+    res = await us.scrape_channel(
+        source_chat_ref=-100123, dest_chat_id=-100999,
+        media_types=["photo"], limit=2, parallel=10)
+    check("photo filter + limit=2 -> 2 newest photos selected",
+          res["hit_limit"] is True and res["sent_count"] == 2
+          and sorted(f[0] for f in fc.forwards) == [9, 10],
+          f"res={res} forwards={fc.forwards}")
+
+    # F. status callbacks announce the limit + the final stop note
+    seen_statuses = []
+
+    async def status_cb(text):
+        seen_statuses.append(text)
+    fc = FakeClient(all_msgs)
+    us.client = fc
+    res = await us.scrape_channel(
+        source_chat_ref=-100123, dest_chat_id=-100999,
+        limit=4, parallel=10, status_callback=status_cb)
+    check("initial status announces the limit",
+          any("limit: 4" in t for t in seen_statuses), str(seen_statuses[:2]))
+    check("final status notes the limit stop",
+          any("Stopped at limit" in t for t in seen_statuses))
+
+
+asyncio.run(scrape_limit_tests())
+
+print()
 print(f"RESULT: {PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
